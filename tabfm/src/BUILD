@@ -1,6 +1,6 @@
 load("@rules_python//python:defs.bzl", "py_library", "py_test")
 
-package(default_visibility = ["//visibility:private"])
+package(default_visibility = ["//tabfm:__subpackages__"])
 
 py_library(
     name = "model",

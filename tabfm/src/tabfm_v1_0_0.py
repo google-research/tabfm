@@ -27,7 +27,7 @@ from flax import nnx
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
 from tabfm.src import checkpointing
-from tabfm.src.model import TabFM
+from tabfm.src.model import TabFM, YEmbeddingScheme
 
 # Hugging Face repository ID for TabFM v1.0.0
 HF_REPO_ID = "google/tabfm-v1-0-0"
@@ -57,6 +57,10 @@ class Config:
   fourier_features_num_frequencies: int = 32
   fourier_features_sigma: float = 1.0
   cache_icl_input_only: bool = False
+  y_embedding_scheme: YEmbeddingScheme = (
+      YEmbeddingScheme.ADD_Y_TO_X_POST_EMBEDDING
+  )
+  use_bias: bool = True
 
   def to_dict(self) -> Dict[str, Any]:
     return {
@@ -82,6 +86,8 @@ class Config:
         ),
         "fourier_features_sigma": self.fourier_features_sigma,
         "cache_icl_input_only": self.cache_icl_input_only,
+        "y_embedding_scheme": self.y_embedding_scheme,
+        "use_bias": self.use_bias,
     }
 
 

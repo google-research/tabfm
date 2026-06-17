@@ -21,18 +21,8 @@ import tabfm
 
 def run_example(model=None) -> np.ndarray:
   """Generates dummy data and runs classification."""
-  # 1. Load TabFM v1.0.0 model
   if model is None:
-    # By default, we attempt to download weights from Hugging Face.
-    # In practice, you would load weights from a local path or HF repo:
-    # model = tabfm_v1_0_0.load()
-    #
-    # For this runnable example to work out-of-the-box without HF access/network,
-    # we instantiate a freshly initialized TabFM v1.0.0 model locally.
-    from flax import nnx  # pylint: disable=g-import-not-at-top
-
-    config = tabfm.tabfm_v1_0_0.ClassificationConfig()
-    model = tabfm.tabfm_v1_0_0.TabFM(rngs=nnx.Rngs(0), **config.to_dict())
+    model = tabfm.tabfm_v1_0_0.load(model_type="classification")
 
   # 2. Initialize scikit-learn compatible classifier
   clf = tabfm.TabFMClassifier(model=model)
