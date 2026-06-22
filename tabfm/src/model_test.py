@@ -511,17 +511,6 @@ class TabFMDependenciesTest(parameterized.TestCase):
           ]],
       },
       {
-          'testcase_name': 'ssmax_true',
-          'y_embedding_scheme': YEmbeddingScheme.NONE,
-          'ssmax': True,
-          'expected_output': [[
-              [-0.247781, 0.983028, -0.795648],
-              [-1.01476, 1.266746, -0.662897],
-              [0.831851, 0.357133, 0.547389],
-              [0.86773, 0.354872, 0.550354],
-          ]],
-      },
-      {
           'testcase_name': 'no_fourier_features',
           'y_embedding_scheme': YEmbeddingScheme.NONE,
           'use_fourier_features': False,
@@ -540,7 +529,6 @@ class TabFMDependenciesTest(parameterized.TestCase):
       attention_impl: AttentionImplementation = AttentionImplementation.JAX,
       activation: str = 'gelu',
       feature_group: bool = False,
-      ssmax: bool | str = False,
       use_fourier_features: bool = True,
       icl_num_blocks: int = 1,
   ):
@@ -572,7 +560,6 @@ class TabFMDependenciesTest(parameterized.TestCase):
         dtype=jnp.float32,
         activation=activation,
         feature_group=feature_group,
-        ssmax=ssmax,
         use_fourier_features=use_fourier_features,
 
     )
