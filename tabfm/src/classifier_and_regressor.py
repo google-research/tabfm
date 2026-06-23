@@ -128,32 +128,34 @@ class CategoricalOrdinalEncoder(BaseEstimator, TransformerMixin):
       counts = pd.Series(col).value_counts()
       rare_cats = counts[counts < self.min_frequency].index
 
+      # Determine the candidate categories in the order dictated by the mode.
       if self.mode == "frequency":
-        # Sort by descending frequency; ties broken by appearance order via
-        # stable sort (value_counts preserves insertion order for equal counts
-        # only in pandas >= 1.1 with sort=True, so we use the counts index
-        # directly which is already frequency-sorted).
-        uniques_sorted = counts.index.tolist()
-        # Filter NaNs and string "nan"
-        uniques = [
-            u
-            for u in uniques_sorted
-            if not pd.isna(u) and str(u) != "nan" and u not in rare_cats
-        ]
+        # Descending frequency. value_counts is already frequency-sorted, with
+        # ties broken by appearance order via pandas' stable sort.
+        candidates = counts.index.tolist()
+      elif self.mode == "appearance":
+        # Order of first appearance.
+        candidates = pd.unique(col)
+      elif self.mode == "alphabetical":
+        # Order of first appearance; sorted below once NaNs are removed.
+        candidates = pd.unique(col)
       else:
-        # Default: order of appearance
-        uniques = pd.unique(col)
-        # Filter NaNs
-        mask = ~pd.isna(uniques)
-        uniques = uniques[mask]
-        # Filter string "nan" if present to match TF behavior
-        uniques = [u for u in uniques if str(u) != "nan"]
-        # Filter rare categories
-        uniques = [u for u in uniques if u not in rare_cats]
-        if self.mode == "alphabetical":
-          # Sort categories so encoding matches sklearn's LabelEncoder
-          # convention (classes ordered ascending / alphabetically).
-          uniques = sorted(uniques)
+        raise ValueError(
+            f"Unknown mode: {self.mode!r}. Expected one of 'appearance', "
+            "'alphabetical', or 'frequency'."
+        )
+
+      # Drop NaNs, the literal string "nan" (to match TF behavior), and rare
+      # categories.
+      uniques = [
+          u
+          for u in candidates
+          if not pd.isna(u) and str(u) != "nan" and u not in rare_cats
+      ]
+      if self.mode == "alphabetical":
+        # Sort categories so encoding matches sklearn's LabelEncoder convention
+        # (classes ordered ascending / alphabetically).
+        uniques = sorted(uniques)
 
       self.categories_.append(np.array(uniques))
 
