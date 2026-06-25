@@ -35,6 +35,7 @@ dependencies = [
     "orbax-checkpoint",
     "pandas",
     "scikit-learn",
+    "scipy",
     "typeguard<3",
     "huggingface-hub",
 ]

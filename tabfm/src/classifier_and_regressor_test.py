@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import argparse
-import unittest
+from unittest import mock
 from absl.testing import absltest
 from flax import nnx
 import jax
@@ -21,7 +20,12 @@ import jax.numpy as jnp
 import numpy as np
 import pandas as pd
 from tabfm.src import model as tabfm_model
-from tabfm.src.classifier_and_regressor import EnsembleGenerator, TabFMClassifier, TabFMRegressor, TransformToNumerical
+from tabfm.src.classifier_and_regressor import EnsembleGenerator
+from tabfm.src.classifier_and_regressor import TabFMClassifier
+from tabfm.src.classifier_and_regressor import TabFMRegressor
+from tabfm.src.classifier_and_regressor import TransformToNumerical
+
+# pylint: disable=invalid-name
 
 class EnsembleGeneratorTest(absltest.TestCase):
 
@@ -58,7 +62,7 @@ class EnsembleGeneratorTest(absltest.TestCase):
 
     # Verify structure of permutations
     for perm in perms:
-      self.assertIn(0, perm) # Column 0 should be in the permutation dict
+      self.assertIn(0, perm)  # Column 0 should be in the permutation dict
       mapping = perm[0]
       # Original values are 0, 1, 2
       original_values = set(range(3))
@@ -66,7 +70,8 @@ class EnsembleGeneratorTest(absltest.TestCase):
       self.assertEqual(set(mapping.values()), original_values)
 
     # Verify that we actually have different permutations
-    # It's statistically improbable that 10 estimators all have identity permutation
+    # It's statistically improbable that 10 estimators all have identity
+    # permutation
     identity_count = 0
     for perm in perms:
       mapping = perm[0]
@@ -74,7 +79,9 @@ class EnsembleGeneratorTest(absltest.TestCase):
       if is_identity:
         identity_count += 1
 
-    self.assertLess(identity_count, n_estimators, "Categorical permutations should vary.")
+    self.assertLess(
+        identity_count, n_estimators, "Categorical permutations should vary."
+    )
 
   def test_permute_categorical_application(self):
     # Test that transform actually changes the data
@@ -90,8 +97,9 @@ class EnsembleGeneratorTest(absltest.TestCase):
         norm_methods=["none"],
         cat_features=cat_features,
         permute_categorical=True,
-        feat_shuffle_method="none", # Disable feature shuffling to isolate value permutation
-        random_state=42
+        # Disable feature shuffling to isolate value permutation
+        feat_shuffle_method="none",
+        random_state=42,
     )
 
     generator.fit(X_enc, y)
@@ -119,7 +127,8 @@ class EnsembleGeneratorTest(absltest.TestCase):
         break
 
     if swap_idx != -1:
-      # Compare with an estimator that (hopefully) didn't swap or at least is different
+      # Compare with an estimator that (hopefully) didn't swap or at least is
+      # different
       # Actually, let's just compare X_out[swap_idx] vs input logic.
       # Input col 0: [0, 1]
       # Swapped col 0: [1, 0]
@@ -128,27 +137,39 @@ class EnsembleGeneratorTest(absltest.TestCase):
       # So the output values should be inverted relative to each other?
       # WAIT: The StandardScaler is fitted on the permuted TRAINING data.
       # If we permute train and test consistently, the distribution stats might
-      # remain similar (since it's just relabeling), but the *instances* change values.
+      # remain similar (since it's just relabeling), but the *instances* change
+      # values.
       # 0 becomes 1.
 
       # Let's verify that X_out[swap_idx, 0, 0] (Sample 0, Feat 0)
       # is different from X_out[identity_idx, 0, 0] if we find an identity one.
 
-      # Easier check: In the swapped estimator, Sample 0 (was 0->1) should look like Sample 1 (was 1)
-      # from a non-swapped estimator? No, Sample 1 in non-swapped is 1. Sample 0 in swapped is 1.
-      # So yes, X_out[swap_idx, 0, 0] should be close to X_out[non_swapped, 1, 0].
+      # Easier check: In the swapped estimator, Sample 0 (was 0->1) should look
+      # like Sample 1 (was 1)
+      # from a non-swapped estimator? No, Sample 1 in non-swapped is 1. Sample 0
+      # in swapped is 1.
+      # So yes, X_out[swap_idx, 0, 0] should be close to
+      # X_out[non_swapped, 1, 0].
       pass
 
-    # Simply asserting that outputs are not all identical across estimators for col 0
+    # Assert outputs are not all identical across estimators for col 0.
     col0_values = X_out[:, 0, 0] # (n_estimators,)
-    self.assertTrue(np.std(col0_values) > 1e-6, "Categorical values should vary across estimators due to permutation")
+    self.assertGreater(
+        np.std(col0_values),
+        1e-6,
+        "Categorical values should vary across estimators due to permutation",
+    )
 
     # Verify col 1 (numerical) does NOT vary (feat_shuffle="none")
     # Actually PreprocessingPipeline adds noise? No, only RTDLQuantile does.
     # CustomStandardScaler is deterministic.
     # So col 1 should be identical across estimators.
     col1_values = X_out[:, 0, 1]
-    self.assertTrue(np.std(col1_values) < 1e-6, "Numerical values should not vary if shuffling is off")
+    self.assertLess(
+        np.std(col1_values),
+        1e-6,
+        "Numerical values should not vary if shuffling is off",
+    )
 
   def test_permute_categorical_false(self):
     X_enc = np.array([[0, 10.0], [1, 20.0], [2, 30.0]])
@@ -176,7 +197,398 @@ class EnsembleGeneratorTest(absltest.TestCase):
 
     # Check that outputs are identical across estimators for col 0
     col0_values = X_out[:, 0, 0]
-    self.assertTrue(np.std(col0_values) < 1e-6, "Categorical values should be identical if permutation is disabled")
+    self.assertLess(
+        np.std(col0_values),
+        1e-6,
+        "Categorical values should be identical if permutation is disabled",
+    )
+
+  def test_row_and_col_subsampling(self):
+    X_enc = np.array([[0, 10.0], [1, 20.0], [2, 30.0], [3, 40.0]])
+    y = np.array([0, 1, 0, 1])
+
+    generator = EnsembleGenerator(
+        n_estimators=5,
+        norm_methods=["none"],
+        max_num_rows=2,
+        max_num_features=1,
+        random_state=42,
+    )
+
+    generator.fit(X_enc, y)
+
+    feat_patterns = generator.feature_shuffle_patterns_["none"]
+    for p in feat_patterns:
+      self.assertLen(p, 1)
+
+    row_patterns = generator.row_subsample_patterns_["none"]
+    for p in row_patterns:
+      self.assertLen(p, 2)
+
+    X_test = np.array([[4, 50.0], [5, 60.0]])
+    data = generator.transform(X_test)
+    X_out, y_out = data["none"]
+
+    self.assertEqual(X_out.shape, (5, 4, 1))
+    self.assertEqual(y_out.shape, (5, 2))
+
+  def test_max_num_features(self):
+    X_enc = np.random.rand(10, 5)
+    y = np.random.randint(0, 2, size=10)
+
+    generator = EnsembleGenerator(
+        n_estimators=5,
+        norm_methods=["none"],
+        max_num_features=2,
+        random_state=42,
+    )
+
+    generator.fit(X_enc, y)
+
+    feat_patterns = generator.feature_shuffle_patterns_["none"]
+    for p in feat_patterns:
+      self.assertLen(p, 2)
+
+  def test_variable_crosses_shapes(self):
+    X_enc = np.random.rand(10, 5)
+    y = np.random.randint(0, 2, size=10)
+
+    # 1. Test "split" strategy
+    generator = EnsembleGenerator(
+        n_estimators=5,
+        norm_methods=["none"],
+        n_feature_crosses=4,
+        ensemble_feature_strategy="split",
+        random_state=42,
+    )
+    generator.fit(X_enc, y)
+
+    self.assertEqual(generator.k_crosses_list_, [0, 4, 0, 4, 0])
+
+    data = generator.transform(X_enc)
+    X_out, _ = data["none"]
+    # max features = 5 + 4 = 9
+    self.assertEqual(X_out.shape[2], 9)
+
+    # 2. Test "random" strategy
+    generator_random = EnsembleGenerator(
+        n_estimators=5,
+        norm_methods=["none"],
+        n_feature_crosses=4,
+        ensemble_feature_strategy="random",
+        random_state=42,
+    )
+    generator_random.fit(X_enc, y)
+
+    for k in generator_random.k_crosses_list_:
+      self.assertTrue(0 <= k <= 4)
+
+
+class OOFPredictionTest(absltest.TestCase):
+
+  def test_classifier_predict_oof_proba(self):
+    model = tabfm_model.TabFM(
+        loss="cross_entropy",
+        max_classes=2,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=1,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        rngs=nnx.Rngs(0),
+    )
+    classifier = TabFMClassifier(
+        model=model, n_estimators=2, batch_size=2
+    )
+
+    X = np.random.rand(10, 3)
+    y = np.random.randint(0, 2, size=10)
+
+    classifier.fit(X, y)
+
+    def mock_forward(Xs_batch, ys_batch, _cat_masks_batch=None, **_kwargs):
+      test_size = Xs_batch.shape[1] - ys_batch.shape[1]
+      return np.zeros((Xs_batch.shape[0], test_size, 2))
+
+    with mock.patch.object(
+        classifier, "_batch_forward", side_effect=mock_forward
+    ) as mock_batch_forward:
+      oof_preds = classifier.predict_oof_proba(cv=2)
+
+      self.assertEqual(oof_preds.shape, (2, 10, 2))
+      self.assertTrue(mock_batch_forward.called)
+
+  def test_regressor_feature_crosses(self):
+    regressor = TabFMRegressor(
+        n_feature_crosses=2,
+        n_estimators=2,
+        model=mock.Mock(),
+        ensemble_feature_strategy="constant",
+    )
+
+    X = np.random.rand(10, 4)
+    y = np.random.rand(10)
+
+    regressor.fit(X, y)
+
+    # Pooled data should have N + E*K = 4 + 2*2 = 8 columns
+    self.assertEqual(regressor.ensemble_generator_.X_.shape[1], 8)
+
+    X_test = np.random.rand(5, 4)
+    data = regressor.ensemble_generator_.transform(X_test)
+    for _, (Xs, _) in data.items():
+      # Each member should only extract N + K = 4 + 2 = 6 columns
+      self.assertEqual(Xs.shape[2], 6)
+
+  def test_regressor_svd_features(self):
+    regressor = TabFMRegressor(
+        n_svd_features=2,
+        n_estimators=2,
+        model=mock.Mock(),
+        ensemble_feature_strategy="constant",
+    )
+
+    X = pd.DataFrame({
+        "num1": np.random.rand(10),
+        "num2": np.random.rand(10),
+        "cat1": ["a", "b", "a", "b", "a", "b", "a", "b", "a", "b"],
+    })
+    y = np.random.rand(10)
+
+    regressor.fit(X, y)
+
+    # 3 original (2 num + 1 cat) + 3 SVD (4 OHE-features prep, min(10, 4)-1 = 3)
+    self.assertEqual(regressor.ensemble_generator_.X_.shape[1], 6)
+
+    X_test = pd.DataFrame({
+        "num1": np.random.rand(5),
+        "num2": np.random.rand(5),
+        "cat1": ["a", "b", "a", "b", "a"],
+    })
+    X_test_encoded = regressor.X_encoder_.transform(X_test)
+    data = regressor.ensemble_generator_.transform(X_test_encoded)
+    for _, (Xs, _) in data.items():
+      self.assertEqual(Xs.shape[2], 5)
+
+  def test_regressor_nnls_blending(self):
+    model = tabfm_model.TabFM(
+        loss="rmse",
+        max_classes=10,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=1,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        rngs=nnx.Rngs(0),
+    )
+    regressor = TabFMRegressor(
+        model=model,
+        n_estimators=2,
+        batch_size=2,
+        enable_nnls=True,
+        nnls_beta=0.5,
+    )
+
+    X = np.random.rand(10, 3)
+    y = np.random.rand(10)
+
+    def mock_forward(Xs_batch, ys_batch, _cat_mask_batch=None, **_kwargs):
+      test_size = Xs_batch.shape[1] - ys_batch.shape[1]
+      return np.zeros((Xs_batch.shape[0], test_size, 1))
+
+    with mock.patch.object(
+        regressor, "_batch_forward", side_effect=mock_forward
+    ) as mock_batch_forward:
+      regressor.fit(X, y)
+
+      self.assertTrue(mock_batch_forward.called)
+      self.assertTrue(hasattr(regressor, "ensemble_weights_"))
+      self.assertEqual(regressor.ensemble_weights_.shape, (2,))
+      self.assertAlmostEqual(np.sum(regressor.ensemble_weights_), 1.0)
+
+      test_preds = regressor.predict(X[:3])
+      self.assertEqual(test_preds.shape, (3,))
+
+  def test_regressor_sqrt_schedule(self):
+    regressor = TabFMRegressor(
+        n_feature_crosses="sqrt",
+        n_svd_features="sqrt",
+        max_num_features=4,
+        n_estimators=2,
+        model=mock.Mock(),
+        ensemble_feature_strategy="constant",
+    )
+
+    X = np.random.rand(10, 5)
+    y = np.random.rand(10)
+
+    regressor.fit(X, y)
+
+    # 5 original + 4 crosses pool + 4 SVD pool = 13 columns
+    self.assertEqual(regressor.ensemble_generator_.X_.shape[1], 13)
+
+    X_test = np.random.rand(5, 5)
+    X_test_encoded = regressor.X_encoder_.transform(X_test)
+    data = regressor.ensemble_generator_.transform(X_test_encoded)
+    for _, (Xs, _) in data.items():
+      # max_num_features (4) + K_crosses (2) + K_svd (2) = 8 columns
+      self.assertEqual(Xs.shape[2], 8)
+
+  def test_regressor_predict_boosting(self):
+    model = tabfm_model.TabFM(
+        loss="rmse",
+        max_classes=10,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=1,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        rngs=nnx.Rngs(0),
+    )
+    regressor = TabFMRegressor(
+        model=model,
+        n_estimators=2,
+        batch_size=2,
+        boosting_alpha=0.1,
+    )
+
+    X = np.random.rand(10, 3)
+    y = np.random.rand(10)
+
+    def mock_forward(Xs_batch, ys_batch, _cat_mask_batch=None, **_kwargs):
+      test_size = Xs_batch.shape[1] - ys_batch.shape[1]
+      return np.zeros((Xs_batch.shape[0], test_size, 1))
+
+    with mock.patch.object(
+        regressor, "_batch_forward", side_effect=mock_forward
+    ) as mock_batch_forward:
+      regressor.fit(X, y)
+
+      self.assertTrue(mock_batch_forward.called)
+      self.assertTrue(hasattr(regressor, "y_oof_scaled_"))
+      self.assertEqual(regressor.y_oof_scaled_.shape, (2, 10))
+
+      mock_batch_forward.reset_mock()
+      test_preds = regressor.predict(X[:3])
+      self.assertEqual(test_preds.shape, (3,))
+      self.assertEqual(mock_batch_forward.call_count, 2)
+
+  def test_regressor_predict_oof(self):
+    model = tabfm_model.TabFM(
+        loss="rmse",
+        max_classes=10,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=1,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        rngs=nnx.Rngs(0),
+    )
+    regressor = TabFMRegressor(
+        model=model, n_estimators=2, batch_size=2
+    )
+
+    X = np.random.rand(10, 3)
+    y = np.random.rand(10)
+
+    regressor.fit(X, y)
+
+    def mock_forward(Xs_batch, ys_batch, _cat_masks_batch=None, **_kwargs):
+      test_size = Xs_batch.shape[1] - ys_batch.shape[1]
+      return np.zeros((Xs_batch.shape[0], test_size, 1))
+
+    with mock.patch.object(
+        regressor, "_batch_forward", side_effect=mock_forward
+    ) as mock_batch_forward:
+      oof_preds = regressor.predict_oof(cv=2)
+
+      self.assertEqual(oof_preds.shape, (2, 10))
+      self.assertTrue(mock_batch_forward.called)
+
+  def test_classifier_predict_oof_proba_with_subsampling(self):
+    model = tabfm_model.TabFM(
+        loss="cross_entropy",
+        max_classes=2,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=1,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        rngs=nnx.Rngs(0),
+    )
+    classifier = TabFMClassifier(
+        model=model,
+        n_estimators=2,
+        batch_size=2,
+        max_num_rows=8,
+    )
+
+    X = np.random.rand(10, 3)
+    y = np.array([0, 1] * 5)
+
+    classifier.fit(X, y)
+
+    def mock_forward(Xs_batch, ys_batch, _cat_masks_batch=None, **_kwargs):
+      test_size = Xs_batch.shape[1] - ys_batch.shape[1]
+      return np.zeros((Xs_batch.shape[0], test_size, 2))
+
+    with mock.patch.object(
+        classifier, "_batch_forward", side_effect=mock_forward
+    ) as mock_batch_forward:
+      oof_preds = classifier.predict_oof_proba(cv=2)
+
+      self.assertEqual(oof_preds.shape, (2, 10, 2))
+      self.assertTrue(mock_batch_forward.called)
+
+  def test_regressor_variable_crosses_predict_flow(self):
+    regressor = TabFMRegressor(
+        n_estimators=2,
+        batch_size=2,
+        n_feature_crosses=2,
+        n_svd_features=3,
+        ensemble_feature_strategy="split",
+        model=mock.Mock(),
+    )
+
+    X = np.random.rand(10, 3)
+    y = np.random.rand(10)
+    X_test = np.random.rand(5, 3)
+
+    def mock_forward(Xs_batch, ys_batch, _cat_masks_batch=None, **_kwargs):
+      test_size = Xs_batch.shape[1] - ys_batch.shape[1]
+      return np.zeros((Xs_batch.shape[0], test_size, 1))
+
+    with mock.patch.object(
+        regressor, "_batch_forward", side_effect=mock_forward
+    ) as mock_batch_forward:
+      regressor.fit(X, y)
+      self.assertEqual(regressor.ensemble_generator_.k_crosses_list_, [0, 2])
+      self.assertEqual(regressor.ensemble_generator_.k_svd_list_, [0, 3])
+
+      preds = regressor.predict(X_test)
+      self.assertEqual(preds.shape, (5,))
+
+      self.assertTrue(mock_batch_forward.called)
 
 
 class BatchForwardTest(absltest.TestCase):
@@ -197,11 +609,9 @@ class BatchForwardTest(absltest.TestCase):
         icl_nhead=2,
         rngs=rngs,
     )
-    config = argparse.Namespace()
-    config.batch_size = 2
 
     classifier = TabFMClassifier(
-        model=model, config=config, n_estimators=4, batch_size=2
+        model=model, n_estimators=4, batch_size=2
     )
     classifier.n_classes_ = 3
     classifier.classes_ = np.array([0, 1, 2])
@@ -215,7 +625,8 @@ class BatchForwardTest(absltest.TestCase):
     # Run _batch_forward. Uses data-parallel JAX sharding internally.
     outputs = classifier._batch_forward(Xs, ys)
 
-    # After concatenation, output shape should be (n_estimators, test_size, num_classes).
+    # After concatenation, output shape should be
+    # (n_estimators, test_size, num_classes).
     # Since Xs length is 10 and ys length (train_size) is 6, test_size is 4.
     self.assertEqual(outputs.shape, (4, 4, 3))
 
@@ -235,11 +646,8 @@ class BatchForwardTest(absltest.TestCase):
         icl_nhead=2,
         rngs=rngs,
     )
-    config = argparse.Namespace()
-    config.batch_size = 2
-    config.loss = "rmse"
 
-    regressor = TabFMRegressor(model=model, config=config, n_estimators=4)
+    regressor = TabFMRegressor(model=model, n_estimators=4)
 
     # Generate dummy input arrays.
     Xs = np.random.rand(4, 10, 5)
@@ -249,7 +657,7 @@ class BatchForwardTest(absltest.TestCase):
     # Run _batch_forward. Uses data-parallel JAX sharding internally.
     outputs = regressor._batch_forward(Xs, ys)
 
-    # After concatenation, output shape should be (n_estimators, test_size, out_dim).
+    # Output shape should be (n_estimators, test_size, out_dim).
     # Since Xs length is 10 and ys length (train_size) is 6, test_size is 4.
     # TabFM with rmse outputs 1 value per prediction.
     self.assertEqual(outputs.shape, (4, 4, 1))
@@ -270,11 +678,8 @@ class BatchForwardTest(absltest.TestCase):
         icl_nhead=2,
         rngs=rngs,
     )
-    config = argparse.Namespace()
-    config.batch_size = 2
-    config.loss = "cross_entropy"
 
-    regressor = TabFMRegressor(model=model, config=config, n_estimators=4)
+    regressor = TabFMRegressor(model=model, n_estimators=4)
 
     # Generate dummy input arrays.
     Xs = np.random.rand(4, 10, 5)
@@ -284,9 +689,325 @@ class BatchForwardTest(absltest.TestCase):
     # Run _batch_forward. Uses data-parallel JAX sharding internally.
     outputs = regressor._batch_forward(Xs, ys)
 
-    # After concatenation, output shape should be (n_estimators, test_size, out_dim).
+    # Output shape should be (n_estimators, test_size, out_dim).
     # TabFM with cross_entropy outputs max_classes bins.
     self.assertEqual(outputs.shape, (4, 4, 10))
+
+
+class CalibrationTest(absltest.TestCase):
+
+  def setUp(self):
+    self.model = tabfm_model.TabFM(
+        loss="cross_entropy",
+        max_classes=2,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=1,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        rngs=nnx.Rngs(0),
+    )
+
+  def test_calibration_binary(self):
+    y = np.concatenate(
+        [np.zeros(50, dtype=np.int64), np.ones(50, dtype=np.int64)]
+    )
+    X = np.random.rand(100, 3)
+    mock_oof = np.random.dirichlet([1, 1], size=(2, 100))
+
+    for method in ["temperature", "platt", "beta"]:
+      classifier = TabFMClassifier(
+          model=self.model,
+          n_estimators=2,
+          binary_calibration_method=method,
+      )
+
+      with mock.patch.object(
+          classifier, "predict_oof_proba", return_value=mock_oof
+      ):
+        classifier.fit(X, y)
+
+      self.assertTrue(hasattr(classifier, "calibration_params_"))
+
+      mock_out = np.random.dirichlet([1, 1], size=(2, 100))
+
+      with mock.patch.object(
+          classifier, "_batch_forward", return_value=mock_out
+      ):
+        probs = classifier.predict_proba(X)
+        self.assertEqual(probs.shape, (100, 2))
+
+  def test_calibration_multiclass(self):
+    model = tabfm_model.TabFM(
+        loss="cross_entropy",
+        max_classes=3,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=1,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        rngs=nnx.Rngs(0),
+    )
+    y = np.concatenate([
+        np.zeros(50, dtype=np.int64),
+        np.ones(50, dtype=np.int64),
+        np.full(50, 2, dtype=np.int64),
+    ])
+    X = np.random.rand(150, 3)
+    mock_oof = np.random.dirichlet([1, 1, 1], size=(2, 150))
+
+    for method in ["temperature", "vector", "dirichlet"]:
+      classifier = TabFMClassifier(
+          model=model,
+          n_estimators=2,
+          multiclass_calibration_method=method,
+      )
+
+      with mock.patch.object(
+          classifier, "predict_oof_proba", return_value=mock_oof
+      ):
+        classifier.fit(X, y)
+
+      self.assertTrue(hasattr(classifier, "calibration_params_"))
+
+      mock_out = np.random.dirichlet([1, 1, 1], size=(2, 150))
+
+      with mock.patch.object(
+          classifier, "_batch_forward", return_value=mock_out
+      ):
+        probs = classifier.predict_proba(X)
+        self.assertEqual(probs.shape, (150, 3))
+
+
+class StackingTest(absltest.TestCase):
+
+  def setUp(self):
+    self.model = tabfm_model.TabFM(
+        loss="cross_entropy",
+        max_classes=2,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=1,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        rngs=nnx.Rngs(0),
+    )
+
+  def test_classifier_crosses_and_svd(self):
+    classifier = TabFMClassifier(
+        model=self.model,
+        n_estimators=2,
+        n_feature_crosses="sqrt",
+        n_svd_features="sqrt",
+        max_num_features=4,
+        ensemble_feature_strategy="constant",
+    )
+
+    X = pd.DataFrame({
+        "num1": np.random.rand(10),
+        "num2": np.random.rand(10),
+        "num3": np.random.rand(10),
+        "cat1": ["a", "b", "a", "b", "a", "b", "a", "b", "a", "b"],
+        "cat2": ["x", "y", "x", "y", "x", "y", "x", "y", "x", "y"],
+    })
+    y = np.array([0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
+
+    classifier.fit(X, y)
+
+    self.assertEqual(classifier.ensemble_generator_.X_.shape[1], 12)
+
+    probs = classifier.predict_proba(X)
+    self.assertEqual(probs.shape, (10, 2))
+
+  def test_classifier_nnls_blending(self):
+    classifier = TabFMClassifier(
+        model=self.model,
+        n_estimators=2,
+        enable_nnls=True,
+        nnls_beta=0.5,
+        average_logits=False,
+    )
+
+    X = np.random.rand(10, 3)
+    y = np.array([0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
+
+    mock_oof = np.random.dirichlet([1, 1], size=(2, 10))
+
+    with mock.patch.object(
+        classifier, "predict_oof_proba", return_value=mock_oof
+    ):
+      classifier.fit(X, y)
+
+    self.assertTrue(hasattr(classifier, "ensemble_weights_"))
+    self.assertEqual(classifier.ensemble_weights_.shape, (2,))
+    self.assertAlmostEqual(np.sum(classifier.ensemble_weights_), 1.0)
+
+    mock_logits = np.random.rand(2, 5, 2)
+    with mock.patch.object(
+        classifier, "_predict_proba_internal", return_value=mock_logits
+    ):
+      probs = classifier.predict_proba(X[:5])
+      self.assertEqual(probs.shape, (5, 2))
+
+  def test_classifier_nnls_and_calibration(self):
+    classifier = TabFMClassifier(
+        model=self.model,
+        n_estimators=2,
+        enable_nnls=True,
+        nnls_beta=0.5,
+        binary_calibration_method="platt",
+        average_logits=False,
+    )
+
+    X = np.random.rand(50, 3)
+    y = np.concatenate(
+        [np.zeros(25, dtype=np.int64), np.ones(25, dtype=np.int64)]
+    )
+
+    mock_oof = np.random.dirichlet([1, 1], size=(2, 50))
+
+    with mock.patch.object(
+        classifier, "predict_oof_proba", return_value=mock_oof
+    ):
+      with mock.patch.object(classifier, "_fit_calibration") as mock_fit_cal:
+        classifier.fit(X, y)
+
+        self.assertTrue(mock_fit_cal.called)
+        P_arg = mock_fit_cal.call_args[0][0]
+        expected_P = np.tensordot(
+            classifier.ensemble_weights_, mock_oof, axes=(0, 0)
+        )
+        np.testing.assert_allclose(P_arg, expected_P)
+
+  def test_classifier_nnls_and_calibration_small_dataset(self):
+    classifier = TabFMClassifier(
+        model=self.model,
+        n_estimators=2,
+        enable_nnls=True,
+        nnls_beta=0.5,
+        binary_calibration_method="platt",
+        calibration_lambda=0.01,
+        average_logits=False,
+    )
+
+    X = np.random.rand(10, 3)
+    y = np.array([0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
+    mock_oof = np.random.dirichlet([1, 1], size=(2, 10))
+
+    with mock.patch.object(
+        classifier, "predict_oof_proba", return_value=mock_oof
+    ):
+      classifier.fit(X, y)
+
+    self.assertEqual(classifier.active_calibration_method_, "platt")
+    self.assertTrue(hasattr(classifier, "calibration_params_"))
+    self.assertIn("A", classifier.calibration_params_)
+
+  def test_average_logits_and_enable_nnls_raises(self):
+    with self.assertRaises(ValueError):
+      TabFMClassifier(
+          model=self.model,
+          average_logits=True,
+          enable_nnls=True,
+      )
+
+  def test_max_num_rows(self):
+    classifier = TabFMClassifier(
+        model=self.model,
+        n_estimators=2,
+        max_num_rows=6,
+    )
+    X = np.random.rand(10, 3)
+    y = np.array([0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
+
+    mock_oof = np.random.dirichlet([1, 1], size=(2, 10))
+    with mock.patch.object(
+        classifier, "predict_oof_proba", return_value=mock_oof
+    ):
+      classifier.fit(X, y)
+
+    self.assertEqual(classifier.ensemble_generator_.X_.shape[0], 10)
+    patterns_none = classifier.ensemble_generator_.row_subsample_patterns_[
+        "none"
+    ]
+    patterns_power = classifier.ensemble_generator_.row_subsample_patterns_[
+        "power"
+    ]
+    self.assertLen(patterns_none[0], 6)
+    self.assertLen(patterns_power[0], 6)
+
+  def test_min_samples_per_class_for_calibration(self):
+    classifier = TabFMClassifier(
+        model=self.model,
+        n_estimators=2,
+        binary_calibration_method="platt",
+        min_samples_per_class_for_calibration=20,
+    )
+    X = np.random.rand(10, 3)
+    y = np.array([0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
+
+    mock_oof = np.random.dirichlet([1, 1], size=(2, 10))
+    with mock.patch.object(
+        classifier, "predict_oof_proba", return_value=mock_oof
+    ):
+      classifier.fit(X, y)
+
+    self.assertIsNone(classifier.active_calibration_method_)
+
+
+class EnsemblePresetTest(absltest.TestCase):
+
+  def test_classifier_ensemble_preset(self):
+    clf = TabFMClassifier.ensemble(model=mock.Mock())
+    self.assertEqual(clf.n_estimators, 32)
+    self.assertFalse(clf.average_logits)
+    self.assertEqual(clf.n_feature_crosses, "sqrt")
+    self.assertEqual(clf.n_svd_features, "sqrt")
+    self.assertTrue(clf.enable_nnls)
+    self.assertEqual(clf.binary_calibration_method, "platt")
+    self.assertEqual(clf.multiclass_calibration_method, "vector")
+    # Default-mode knobs are unchanged by the preset.
+    self.assertEqual(clf.max_num_features, 500)
+
+  def test_regressor_ensemble_preset(self):
+    reg = TabFMRegressor.ensemble(model=mock.Mock())
+    self.assertEqual(reg.n_estimators, 32)
+    self.assertEqual(reg.n_feature_crosses, "sqrt")
+    self.assertEqual(reg.n_svd_features, "sqrt")
+    self.assertTrue(reg.enable_nnls)
+    self.assertEqual(reg.boosting_alpha, 0.1)
+    self.assertEqual(reg.max_num_features, 500)
+
+  def test_ensemble_overrides_take_precedence(self):
+    clf = TabFMClassifier.ensemble(
+        model=mock.Mock(), n_estimators=8, enable_nnls=False
+    )
+    self.assertEqual(clf.n_estimators, 8)
+    self.assertFalse(clf.enable_nnls)
+    # Non-overridden preset values are preserved.
+    self.assertEqual(clf.n_feature_crosses, "sqrt")
+
+  def test_default_mode_keeps_features_off(self):
+    clf = TabFMClassifier(model=mock.Mock())
+    self.assertEqual(clf.n_estimators, 32)
+    self.assertEqual(clf.max_num_features, 500)
+    self.assertTrue(clf.average_logits)
+    self.assertEqual(clf.n_feature_crosses, 0)
+    self.assertEqual(clf.n_svd_features, 0)
+    self.assertFalse(clf.enable_nnls)
+    self.assertIsNone(clf.binary_calibration_method)
 
 
 if __name__ == "__main__":
