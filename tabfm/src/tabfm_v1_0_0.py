@@ -127,7 +127,7 @@ def load(
     checkpoint_path: Optional[str] = None,
     step: Optional[int] = None,
     *,
-    col_attention_impl: str = 'jax',
+    col_attention_impl: str = 'flash',
     row_attention_impl: str = 'jax',
     icl_attention_impl: str = 'flash',
     dtype: Any = jnp.bfloat16,
@@ -145,10 +145,12 @@ def load(
       to download from Hugging Face.
     step: The checkpoint step to restore (for local loading).
     col_attention_impl: Attention implementation for the column-attention layers
-      ('jax', 'flash', etc.). Defaults to 'jax'; column attention is over the
-      (small) feature dimension, so flash rarely helps there.
+      ('jax', 'flash', etc.). Defaults to 'flash'; column attention can run over
+      up to ``max_num_features`` columns, so flash keeps memory bounded for wide
+      datasets (negligible overhead for narrow ones).
     row_attention_impl: Attention implementation for the row-attention layers.
-      Defaults to 'jax'.
+      Defaults to 'jax' (row attention is over a handful of CLS tokens, so flash
+      would be pure overhead).
     icl_attention_impl: Attention implementation for the in-context (ICL) layers
       ('jax', 'flash', etc.). Defaults to 'flash' since ICL attention runs over
       the full row context and is the memory-critical path for large datasets.
