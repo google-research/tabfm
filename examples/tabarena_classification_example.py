@@ -14,8 +14,8 @@
 
 """Classification on a real TabArena task with TabFM v1.0.0.
 
-Loads repeat-0 / fold-0 of the TabArena ``credit-g`` task (a small dataset with
-a mix of numerical and categorical columns), then runs inference twice:
+Loads repeat-0 / fold-0 of the TabArena ``maternal_health_risk`` task (a small
+3-class dataset with string labels), then runs inference twice:
 
   * default  -- ``TabFMClassifier(model=...)`` (uniform logit averaging)
   * ensemble -- ``TabFMClassifier.ensemble(model=...)`` (feature crosses / SVD
@@ -29,19 +29,18 @@ Requires the optional ``openml`` dependency: ``pip install tabfm[examples]``.
 import numpy as np
 import tabfm
 
-# OpenML task id for the TabArena "credit-g" classification task (1000 rows,
-# 7 numerical + 13 categorical features, binary target).
-TASK_ID = 363626
+# OpenML task id for the TabArena "maternal_health_risk" classification task
+# (1014 rows, 6 numerical features, 3-class string target).
+TASK_ID = 363685
 SEED = 0
 
 
 def _load_fold_0(task_id):
   """Returns (X_train, y_train, X_test, y_test) for repeat-0 / fold-0.
 
-  Note: both X and y are passed to TabFM as raw OpenML values. TabFM routes
-  each feature column by dtype internally (pandas ``category`` columns are
-  handled natively by ``CategoricalOrdinalEncoder``) and label-encodes the
-  string/category target itself, so no manual coercion is needed here.
+  Note: both X and y are passed to TabFM as raw OpenML values -- including the
+  string class labels, which TabFM label-encodes internally (and exposes via
+  ``clf.classes_``) -- so no manual coercion is needed here.
   """
   import openml  # pylint: disable=g-import-not-at-top
 
@@ -115,7 +114,7 @@ def run_example(model=None):
 
 if __name__ == "__main__":
   print(
-      "Running TabFM classification on TabArena credit-g (fold 0)..."
+      "Running TabFM classification on TabArena maternal_health_risk (fold 0)..."
       " (Note: JAX compilation and model execution may take a few minutes on"
       " first run)"
   )
