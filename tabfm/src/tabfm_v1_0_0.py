@@ -111,7 +111,7 @@ class RegressionConfig(Config):
 # safely across callers.
 #
 # It is a dict keyed by load settings (model_type, checkpoint_path, step,
-# attention_impl, dtype) rather than a single slot for two reasons:
+# col/row/icl attention impls, dtype) rather than a single slot for two reasons:
 #   1. Distinct variants can coexist in one process -- most commonly the
 #      classification and regression models -- so a single slot would evict
 #      one whenever the other is loaded and re-pay the restore each switch.
@@ -126,8 +126,10 @@ def load(
     model_type: str = "classification",
     checkpoint_path: Optional[str] = None,
     step: Optional[int] = None,
-    attention_impl: str = 'flash',
     *,
+    col_attention_impl: str = 'jax',
+    row_attention_impl: str = 'jax',
+    icl_attention_impl: str = 'flash',
     dtype: Any = jnp.bfloat16,
     use_cache: bool = True,
 ) -> TabFM:
@@ -142,7 +144,14 @@ def load(
     checkpoint_path: Local directory containing the 'orbax/' checkpoint, or None
       to download from Hugging Face.
     step: The checkpoint step to restore (for local loading).
-    attention_impl: Attention implementation to use ('jax', 'flash', etc.).
+    col_attention_impl: Attention implementation for the column-attention layers
+      ('jax', 'flash', etc.). Defaults to 'jax'; column attention is over the
+      (small) feature dimension, so flash rarely helps there.
+    row_attention_impl: Attention implementation for the row-attention layers.
+      Defaults to 'jax'.
+    icl_attention_impl: Attention implementation for the in-context (ICL) layers
+      ('jax', 'flash', etc.). Defaults to 'flash' since ICL attention runs over
+      the full row context and is the memory-critical path for large datasets.
     dtype: Calculations dtype for JAX.
     use_cache: If True (default), reuse a process-wide cached model when one was
       already loaded with identical settings. Set False to force a fresh load.
@@ -150,13 +159,15 @@ def load(
   Returns:
     An initialized TabFM model with restored weights.
   """
-  cache_key = (model_type, checkpoint_path, step, attention_impl, str(dtype))
+  cache_key = (
+      model_type, checkpoint_path, step,
+      col_attention_impl, row_attention_impl, icl_attention_impl, str(dtype),
+  )
   if use_cache and cache_key in _LOAD_CACHE:
     return _LOAD_CACHE[cache_key]
 
   from tabfm.src.model import AttentionImplementation
-  att_impl = AttentionImplementation(attention_impl)
-  
+
   # 1. Instantiate model with hardcoded config based on model_type
   if model_type == "classification":
     config = ClassificationConfig()
@@ -170,7 +181,9 @@ def load(
 
   rngs = nnx.Rngs(0)
   config_dict = config.to_dict()
-  config_dict['icl_attention_impl'] = att_impl
+  config_dict['col_attention_impl'] = AttentionImplementation(col_attention_impl)
+  config_dict['row_attention_impl'] = AttentionImplementation(row_attention_impl)
+  config_dict['icl_attention_impl'] = AttentionImplementation(icl_attention_impl)
   model = TabFM(rngs=rngs, dtype=dtype, **config_dict)
 
   # 2. Get checkpoint directory
