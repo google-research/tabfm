@@ -60,8 +60,9 @@ from . import memory_efficient_attention
 
 class AttentionImplementation(str, enum.Enum):
   JAX = 'jax'
-  # vmaps jax.nn.dot_product_attention over the head dimension to save memory
-  JAX_VMAP_ON_HEAD_DIM = 'jax_vmap_on_head_dim'
+  # Sequentially maps (jax.lax.map) jax.nn.dot_product_attention over the head
+  # dimension, processing one head at a time to save memory.
+  JAX_MAP_ON_HEAD_DIM = 'jax_map_on_head_dim'
   FLASH = 'flash'
   NONE = 'none'
 
@@ -762,7 +763,7 @@ class MultiheadAttention(nnx.Module):
           mask=attn_mask,
           scale=1.0,
       )
-    elif self.attention_impl == AttentionImplementation.JAX_VMAP_ON_HEAD_DIM:
+    elif self.attention_impl == AttentionImplementation.JAX_MAP_ON_HEAD_DIM:
       if attn_mask is not None:
         attn_mask = attn_mask[:, 0, :, :]
       q_h = jnp.swapaxes(q, -2, 0)
