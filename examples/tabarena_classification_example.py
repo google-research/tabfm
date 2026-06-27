@@ -65,11 +65,10 @@ def _evaluate(clf, x_train, y_train, x_test, y_test):
   clf.fit(x_train, y_train)
   proba = np.asarray(clf.predict_proba(x_test))
 
-  # Align probability columns to sorted label order, then encode y_test against
-  # those same labels -- only the sklearn metrics need numeric labels.
-  order = np.argsort(clf.classes_)
-  proba = proba[:, order]
-  labels = np.asarray(clf.classes_)[order]
+  # clf.classes_ is already sorted (sklearn convention) and proba columns are
+  # aligned to it, so it can be used directly as the metric label order. Only
+  # the sklearn metrics need y_test as concrete labels.
+  labels = np.asarray(clf.classes_)
   y_test = np.asarray(y_test)
 
   ll = log_loss(y_test, proba, labels=labels)
