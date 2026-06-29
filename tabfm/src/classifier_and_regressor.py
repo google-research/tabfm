@@ -256,7 +256,11 @@ def check_if_datetime_as_object(X: pd.Series) -> bool:
   Returns:
     True if the series looks like datetime data stored as object dtype.
   """
-  if not pd.api.types.is_object_dtype(X.dtype):
+  # Accept object dtype and the pandas string dtype (incl. the pyarrow-backed
+  # default in pandas>=3); otherwise date-as-text columns load as 'string',
+  # fail this object-only gate, and silently fall through to categorical.
+  if not (pd.api.types.is_object_dtype(X.dtype)
+          or isinstance(X.dtype, pd.StringDtype)):
     return False
   if X.isnull().all():
     return False
