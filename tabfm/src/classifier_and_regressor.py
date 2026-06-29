@@ -1821,6 +1821,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       enable_nnls: bool = False,
       nnls_beta: float = 0.75,
       calibration_lambda: float = 1e-2,
+      min_rows_for_single_val_split: int = 2000,
   ):
     """Initialises the classifier.
 
@@ -1861,6 +1862,9 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       nnls_beta: Blending weight for NNLS.
       calibration_lambda: L2 regularization strength for calibration parameter
         scaling.
+      min_rows_for_single_val_split: Minimum validation rows required to allow
+        learning ensemble/calibration weights on a single train/val split
+        instead of full CV. 0 means always doing full CV.
     """
     self.model = model
     self.n_estimators = n_estimators
@@ -1887,6 +1891,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     self.enable_nnls = enable_nnls
     self.nnls_beta = nnls_beta
     self.calibration_lambda = calibration_lambda
+    self.min_rows_for_single_val_split = min_rows_for_single_val_split
     if self.average_logits and self.enable_nnls:
       raise ValueError("average_logits and enable_nnls cannot both be True.")
     if self.max_num_rows is not None and self.enable_nnls:
@@ -2013,22 +2018,33 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     )
     self.ensemble_generator_.fit(X, y)
 
+    oof_probs_fit = None
     if self.enable_nnls or (
         self.active_calibration_method_ is not None
         and self.active_calibration_method_ != "none"
     ):
       oof_probs = self.predict_oof_proba(cv=self.num_folds_for_cv)
+      val_idx = getattr(self, "oof_val_indices_", None)
+      if val_idx is not None:
+        oof_probs_fit = oof_probs[:, val_idx, :]
+        y_orig_fit = y_orig[val_idx]
+        y_fit = y[val_idx]
+      else:
+        oof_probs_fit = oof_probs
+        y_orig_fit = y_orig
+        y_fit = y
 
-    if self.enable_nnls:
+    if self.enable_nnls and oof_probs_fit is not None:
       n_classes = self.n_classes_
-      n_est, n_tr, _ = oof_probs.shape
+      n_est, n_tr, _ = oof_probs_fit.shape
 
-      # Convert y_orig to one-hot targets
+      # Convert y_orig_fit to one-hot targets
       y_one_hot = np.zeros((n_tr, n_classes))
-      y_one_hot[np.arange(n_tr), y_orig] = 1.0
+      y_one_hot[np.arange(n_tr), y_orig_fit] = 1.0
 
       # Flatten along classification dimensions
-      oof_flat = oof_probs.reshape(n_est, n_tr * n_classes)
+      oof_flat = oof_probs_fit.reshape(n_est, n_tr * n_classes)
+
       y_one_hot_flat = y_one_hot.flatten()
 
       weights, _ = opt.nnls(oof_flat.T, y_one_hot_flat)
@@ -2046,13 +2062,14 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     if (
         self.active_calibration_method_ is not None
         and self.active_calibration_method_ != "none"
+        and oof_probs_fit is not None
     ):
       if self.enable_nnls:
-        P = np.tensordot(self.ensemble_weights_, oof_probs, axes=(0, 0))
+        P = np.tensordot(self.ensemble_weights_, oof_probs_fit, axes=(0, 0))
       else:
-        P = np.mean(oof_probs, axis=0)
-      chex.assert_shape(P, (len(y), self.n_classes_))
-      self._fit_calibration(P, y)
+        P = np.mean(oof_probs_fit, axis=0)
+      chex.assert_shape(P, (len(y_fit), self.n_classes_))
+      self._fit_calibration(P, y_fit)
 
     return self
 
@@ -2292,12 +2309,23 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     )
     folds_base = list(kf.split(np.arange(n_rows)))
 
+    if (
+        getattr(self, "min_rows_for_single_val_split", 0) > 0
+        and len(folds_base[0][1]) >= self.min_rows_for_single_val_split
+    ):
+      folds_to_run = folds_base[:1]
+    else:
+      folds_to_run = folds_base
+
     outputs_oof = np.zeros((n_estimators, N, n_classes))
 
-    for _, (train_fold, val_fold) in enumerate(folds_base):
+    self.oof_val_indices_ = None
+    for fold_idx, (train_fold, val_fold) in enumerate(folds_to_run):
       data_fold, val_indices_list = self.ensemble_generator_.transform_fold(
           train_fold, val_fold
       )
+      if fold_idx == 0 and len(folds_to_run) == 1:
+        self.oof_val_indices_ = val_indices_list[0]
       (
           Xs_batch,
           ys_batch,
@@ -2610,6 +2638,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       total_svd_pool: Optional[int] = None,
       enable_nnls: bool = False,
       nnls_beta: float = 0.75,
+      min_rows_for_single_val_split: int = 2000,
   ):
     """Initialises the regressor.
 
@@ -2639,6 +2668,9 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       total_svd_pool: Total pool size of SVD features to generate.
       enable_nnls: Whether to enable NNLS weighted ensemble.
       nnls_beta: Blending weight for NNLS.
+      min_rows_for_single_val_split: Minimum validation rows required to allow
+        learning ensemble weights on a single train/val split instead of full
+        CV. 0 means always doing full CV.
     """
     self.model = model
     self.n_estimators = n_estimators
@@ -2659,6 +2691,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     self.total_svd_pool = total_svd_pool
     self.enable_nnls = enable_nnls
     self.nnls_beta = nnls_beta
+    self.min_rows_for_single_val_split = min_rows_for_single_val_split
     if self.max_num_rows is not None and self.enable_nnls:
       raise ValueError(
           "max_num_rows and enable_nnls cannot both be set at this time."
@@ -2748,15 +2781,19 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     self.ensemble_generator_.fit(X, y)
 
     if self.enable_nnls:
-      self.y_oof_scaled_ = self._compute_oof_preds_scaled(
-          cv=self.num_folds_for_cv
+      val_idx = getattr(self, "oof_val_indices_", None)
+      y_oof_scaled_fit = (
+          self.y_oof_scaled_[:, val_idx]
+          if val_idx is not None
+          else self.y_oof_scaled_
       )
-      n_est, n_tr = self.y_oof_scaled_.shape
+      y_orig_fit = y_orig[val_idx] if val_idx is not None else y_orig
+      n_est, n_tr = y_oof_scaled_fit.shape
       y_oof = np.zeros((n_est, n_tr))
       for i in range(n_est):
-        y_oof[i, :] = self._inverse_transform_y(self.y_oof_scaled_[i])
+        y_oof[i, :] = self._inverse_transform_y(y_oof_scaled_fit[i])
 
-      weights, _ = opt.nnls(y_oof.T, y_orig)
+      weights, _ = opt.nnls(y_oof.T, y_orig_fit)
       sum_weights = np.sum(weights)
       if sum_weights > 0:
         weights = weights / sum_weights
@@ -2996,10 +3033,21 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
 
     outputs_oof = np.zeros((n_estimators, N))
 
-    for _, (train_fold, val_fold) in enumerate(folds_base):
+    if (
+        getattr(self, "min_rows_for_single_val_split", 0) > 0
+        and len(folds_base[0][1]) >= self.min_rows_for_single_val_split
+    ):
+      folds_to_run = folds_base[:1]
+    else:
+      folds_to_run = folds_base
+
+    self.oof_val_indices_ = None
+    for fold_idx, (train_fold, val_fold) in enumerate(folds_to_run):
       data_fold, val_indices_list = self.ensemble_generator_.transform_fold(
           train_fold, val_fold
       )
+      if fold_idx == 0 and len(folds_to_run) == 1:
+        self.oof_val_indices_ = val_indices_list[0]
       (
           Xs_batch,
           ys_batch,
