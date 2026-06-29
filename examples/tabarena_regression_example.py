@@ -14,9 +14,9 @@
 
 """Regression on a real TabArena task with TabFM v1.0.0.
 
-Loads repeat-0 / fold-0 of the TabArena ``healthcare_insurance_expenses`` task
-(a small dataset with a mix of numerical and categorical columns), then runs
-inference twice:
+Loads repeat-0 / fold-0 of the TabArena ``airfoil_self_noise`` task (a small
+dataset with a mix of numerical and categorical columns), then runs inference
+twice:
 
   * default  -- ``TabFMRegressor(model=...)`` (uniform averaging)
   * ensemble -- ``TabFMRegressor.ensemble(model=...)`` (feature crosses / SVD
@@ -30,9 +30,9 @@ Requires the optional ``openml`` dependency: ``pip install tabfm[examples]``.
 import numpy as np
 import tabfm
 
-# OpenML task id for the TabArena "healthcare_insurance_expenses" regression
-# task (1338 rows, 3 numerical + 3 categorical features).
-TASK_ID = 363675
+# OpenML task id for the TabArena "airfoil_self_noise" regression task
+# (1503 rows, 4 numerical + 1 categorical features).
+TASK_ID = 363612
 SEED = 0
 
 
@@ -102,7 +102,7 @@ def run_example(model=None):
 
 if __name__ == "__main__":
   print(
-      "Running TabFM regression on TabArena healthcare_insurance_expenses"
+      "Running TabFM regression on TabArena airfoil_self_noise"
       " (fold 0)... (Note: JAX compilation and model execution may take a few"
       " minutes on first run)"
   )
