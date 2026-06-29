@@ -889,7 +889,7 @@ class StackingTest(absltest.TestCase):
     self.assertLen(patterns_power[0], 6)
 
   def test_min_rows_for_single_val_split_classifier(self):
-    classifier = TabICLClassifier(
+    classifier = TabFMClassifier(
         model=self.model,
         config=self.config,
         n_estimators=1,
@@ -911,7 +911,7 @@ class StackingTest(absltest.TestCase):
     self.assertEqual(mock_forward.call_count, 1)
 
   def test_min_rows_for_single_val_split_regressor_no_boosting(self):
-    regressor = TabICLRegressor(
+    regressor = TabFMRegressor(
         model=self.model,
         config=argparse.Namespace(loss="rmse"),
         n_estimators=1,
