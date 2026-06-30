@@ -891,7 +891,6 @@ class StackingTest(absltest.TestCase):
   def test_min_rows_for_single_val_split_classifier(self):
     classifier = TabFMClassifier(
         model=self.model,
-        config=self.config,
         n_estimators=1,
         enable_nnls=True,
         average_logits=False,
@@ -910,10 +909,9 @@ class StackingTest(absltest.TestCase):
     # It should therefore only run 1 fold instead of 5.
     self.assertEqual(mock_forward.call_count, 1)
 
-  def test_min_rows_for_single_val_split_regressor_no_boosting(self):
+  def test_min_rows_for_single_val_split_regressor(self):
     regressor = TabFMRegressor(
         model=self.model,
-        config=argparse.Namespace(loss="rmse"),
         n_estimators=1,
         enable_nnls=True,
         boosting_alpha=0.0,

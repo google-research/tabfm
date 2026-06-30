@@ -2781,6 +2781,9 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     self.ensemble_generator_.fit(X, y)
 
     if self.enable_nnls:
+      self.y_oof_scaled_ = self._compute_oof_preds_scaled(
+          cv=self.num_folds_for_cv
+      )
       val_idx = getattr(self, "oof_val_indices_", None)
       y_oof_scaled_fit = (
           self.y_oof_scaled_[:, val_idx]
