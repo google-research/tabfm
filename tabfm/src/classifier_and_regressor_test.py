@@ -914,7 +914,6 @@ class StackingTest(absltest.TestCase):
         model=self.model,
         n_estimators=1,
         enable_nnls=True,
-        boosting_alpha=0.0,
         min_rows_for_single_val_split=2,
         num_folds_for_cv=5,
     )
