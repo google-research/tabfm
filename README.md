@@ -150,6 +150,12 @@ python examples/classification_example.py
 
 ---
 
+## Evaluation Results
+
+Our model evaluation results can be found in [results/](results/).
+
+---
+
 ## Running Tests
 
 You can run the unit tests directly using Python's `unittest` module:
