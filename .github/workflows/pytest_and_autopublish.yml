@@ -38,7 +38,7 @@ jobs:
         # cache-dependency-path: '**/pyproject.toml'
 
     - run: pip --version
-    - run: pip install -e .[dev]
+    - run: pip install -e .[dev,jax,pytorch]
     - run: pip freeze
 
     # Run tests (in parallel)
