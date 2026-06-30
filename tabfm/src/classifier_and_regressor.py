@@ -41,7 +41,6 @@ try:
   from flax import nnx
   from jax.experimental import multihost_utils
   from jax.sharding import NamedSharding, PartitionSpec
-  import chex
   HAS_JAX = True
   Array = jax.Array
 except ImportError:
@@ -2133,7 +2132,10 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         P = np.tensordot(self.ensemble_weights_, oof_probs_fit, axes=(0, 0))
       else:
         P = np.mean(oof_probs_fit, axis=0)
-      chex.assert_shape(P, (len(y_fit), self.n_classes_))
+      assert P.shape == (len(y_fit), self.n_classes_), (
+          f"Expected calibration input shape {(len(y_fit), self.n_classes_)},"
+          f" got {P.shape}"
+      )
       self._fit_calibration(P, y_fit)
 
     return self
