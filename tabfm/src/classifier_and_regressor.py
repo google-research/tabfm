@@ -33,14 +33,26 @@ import random
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from absl import logging
-import chex
-from flax import nnx
-import jax
-from jax.experimental import multihost_utils
-import jax.numpy as jnp
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec
 import numpy as np
+
+try:
+  import jax
+  import jax.numpy as jnp
+  from flax import nnx
+  from jax.experimental import multihost_utils
+  from jax.sharding import NamedSharding, PartitionSpec
+  import chex
+  HAS_JAX = True
+  Array = jax.Array
+except ImportError:
+  HAS_JAX = False
+  Array = np.ndarray  # Fallback for type annotation parser
+
+try:
+  import torch
+  HAS_TORCH = True
+except ImportError:
+  HAS_TORCH = False
 import pandas as pd
 import scipy.optimize as opt
 import scipy.special
@@ -1717,10 +1729,10 @@ def _append_svd_features(
 
 @jt.typed
 def _pad_batch_to_multiple_of(
-    x: jax.Array | np.ndarray,
+    x: Array | np.ndarray,
     divisor: int,
     constant_value: Union[int, float, np.number] = 0,
-) -> jax.Array | np.ndarray:
+) -> Array | np.ndarray:
   """Pad axis 0 of array (at the end) to a multiple of ``divisor``.
 
   Args:
@@ -1756,6 +1768,49 @@ def _pad_cat_mask(cat_mask: np.ndarray, target_features: int) -> np.ndarray:
     pad_cols = target_features - cat_mask.shape[0]
     return np.pad(cat_mask, (0, pad_cols), constant_values=False)
   return cat_mask
+
+
+def _predict_step_pytorch(
+    model: Any,
+    X_batch: np.ndarray,
+    y_batch: np.ndarray,
+    train_size_val: int,
+    ds_batch_val: Optional[np.ndarray],
+    cat_mask_batch: Optional[np.ndarray],
+) -> np.ndarray:
+  """Runs PyTorch forward pass and returns numpy array."""
+  if not HAS_TORCH:
+    raise ImportError("PyTorch is required to run a PyTorch model.")
+
+  device = next(model.parameters()).device
+
+  X_t = torch.from_numpy(X_batch).to(device, dtype=torch.float32)
+  y_t = torch.from_numpy(y_batch).to(device)
+  if y_t.dtype == torch.float64:
+    y_t = y_t.to(torch.float32)
+
+  batch_size = X_batch.shape[0]
+  train_size_t = torch.full(
+      (batch_size,), train_size_val, dtype=torch.long, device=device
+  )
+
+  if ds_batch_val is not None:
+    d_t = torch.from_numpy(ds_batch_val).to(device)
+  else:
+    d_t = torch.full(
+        (batch_size,), X_batch.shape[-1], dtype=torch.long, device=device
+    )
+
+  cat_mask_t = (
+      torch.from_numpy(cat_mask_batch).to(device)
+      if cat_mask_batch is not None
+      else None
+  )
+
+  with torch.no_grad():
+    out_t = model(X_t, y_t, train_size_t, cat_mask=cat_mask_t, d=d_t)
+
+  return out_t.cpu().numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -2076,11 +2131,11 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
   @jt.typed
   def _batch_forward(
       self,
-      Xs: jt.Float[jax.Array | np.ndarray, "B T H"],
-      ys: jt.Shaped[jax.Array | np.ndarray, "B T_train"],
-      cat_masks: Optional[jt.Bool[jax.Array | np.ndarray, "B H"]] = None,
-      ds: Optional[jt.Int[jax.Array | np.ndarray, "B"]] = None,
-  ) -> jt.Float[jax.Array | np.ndarray, "B T_test K"]:
+      Xs: jt.Float[Array | np.ndarray, "B T H"],
+      ys: jt.Shaped[Array | np.ndarray, "B T_train"],
+      cat_masks: Optional[jt.Bool[Array | np.ndarray, "B H"]] = None,
+      ds: Optional[jt.Int[Array | np.ndarray, "B"]] = None,
+  ) -> jt.Float[Array | np.ndarray, "B T_test K"]:
     """Process model forward passes in batches to manage memory efficiently.
 
     This method handles the batched inference through the TabFM model,
@@ -2119,172 +2174,237 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         n_classes)
         where test_size = n_samples - train_size.
     """
-    mesh = jax.sharding.get_mesh()
-    if mesh and "data" in mesh.axis_names:
-      num_data_shards = mesh.axis_sizes[mesh.axis_names.index("data")]
-      data_sharding = NamedSharding(mesh, PartitionSpec("data"))
-    else:
-      num_data_shards = 1
-      data_sharding = None
+    is_torch = HAS_TORCH and isinstance(self.model, torch.nn.Module)
 
-    num_classes = self.n_classes_
-
-    _has_compiled_attr = (
-        "_predict_step_compiled_with_cat"
-        if (cat_masks is not None and hasattr(self.model, "cell_embedder"))
-        else "_predict_step_compiled_no_cat"
-    )
-
-    if not hasattr(self, _has_compiled_attr):
-      data_sharding = NamedSharding(
-          jax.sharding.Mesh(jax.devices(), ("data",)), PartitionSpec("data")
-      )
-
-      if cat_masks is not None and hasattr(self.model, "cell_embedder"):
-
-        @nnx.jit(
-            in_shardings=(
-                None,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-            ),
-            out_shardings=data_sharding,
+    if is_torch:
+      # --- PyTorch execution path ---
+      batch_size_per_process = self.batch_size or Xs.shape[0]
+      n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
+      if n_batches > 1:
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        cat_masks_split = (
+            np.array_split(cat_masks, n_batches)
+            if cat_masks is not None
+            else [None] * n_batches
         )
-        def _predict_step_fn(model, X, y, train_size, d, cat_mask):
-          return model(
-              X,
-              y,
-              train_size=train_size,
-              d=d,
-              cat_mask=cat_mask,
-              num_classes=num_classes,
-          )
-
+        ds_split = (
+            np.array_split(ds, n_batches) if ds is not None else [None] * n_batches
+        )
       else:
-
-        @nnx.jit(
-            in_shardings=(
-                None,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-            ),
-            out_shardings=data_sharding,
-        )
-        def _predict_step_fn(model, X, y, train_size, d):
-          return model(
-              X,
-              y,
-              train_size=train_size,
-              d=d,
-              num_classes=num_classes,
-          )
-
-      setattr(self, _has_compiled_attr, _predict_step_fn)
-
-    _predict_step_compiled = getattr(self, _has_compiled_attr)
-
-    batch_size_per_process = self.batch_size or Xs.shape[0]
-    n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
-    if n_batches > 1:
-      Xs_split = np.array_split(Xs, n_batches)
-      ys_split = np.array_split(ys, n_batches)
-      if cat_masks is not None:
-        cat_masks_split = np.array_split(cat_masks, n_batches)
-      if ds is not None:
-        ds_split = np.array_split(ds, n_batches)
-    else:
-      Xs_split = [Xs]
-      ys_split = [ys]
-      if cat_masks is not None:
+        Xs_split = [Xs]
+        ys_split = [ys]
         cat_masks_split = [cat_masks]
-      if ds is not None:
         ds_split = [ds]
 
-    outputs = []
-    cat_masks_iter = cat_masks_split if cat_masks is not None else [None] * len(Xs_split)
-    ds_iter = ds_split if ds is not None else [None] * len(Xs_split)
-    for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
-        Xs_split, ys_split, cat_masks_iter, ds_iter
-    ):
-      orig_batch_size = X_batch.shape[0]
-      orig_seq_len = X_batch.shape[1]
+      outputs = []
+      for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
+          Xs_split, ys_split, cat_masks_split, ds_split
+      ):
+        orig_batch_size = X_batch.shape[0]
+        orig_seq_len = X_batch.shape[1]
+        train_size_val = y_batch.shape[1]
 
-      # Follow prefill(): pad sequence length T (n_row) to a multiple of 128
-      # with -100. Padded rows fall past train_size and are sliced off below.
-      _block_size = 128
-      _T_full = X_batch.shape[1]
-      _pad_len = ((_T_full - 1) // _block_size + 1) * _block_size - _T_full
-      if _pad_len > 0:
-        X_batch = np.pad(
-            X_batch, ((0, 0), (0, _pad_len), (0, 0)), constant_values=-100.0
-        )
+        # Pad y to match X length along sequence dimension if needed
+        if y_batch.shape[1] < X_batch.shape[1]:
+          y_batch = np.pad(
+              y_batch,
+              ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
+              mode="constant",
+              constant_values=-100.0,
+          )
 
-      X_batch = _pad_batch_to_multiple_of(X_batch, num_data_shards)
-      y_batch = _pad_batch_to_multiple_of(y_batch, num_data_shards)
-
-      X_batch = jax.device_put(jnp.array(X_batch, dtype=jnp.float32), data_sharding)
-      y_batch = jax.device_put(jnp.array(y_batch, dtype=jnp.float32), data_sharding)
-      batch_size_padded = X_batch.shape[0]
-      train_size_val = y_batch.shape[1]
-      train_size = jax.device_put(
-          jnp.repeat(train_size_val, batch_size_padded), data_sharding
-      )
-
-      if ds_batch_val is not None:
-        ds_batch = _pad_batch_to_multiple_of(
-            ds_batch_val, num_data_shards, constant_value=X_batch.shape[-1]
-        )
-      else:
-        ds_batch = np.full(
-            (batch_size_padded,), X_batch.shape[-1], dtype=np.int32
-        )
-
-      d_batch = jax.device_put(
-          jnp.array(ds_batch, dtype=jnp.int32),
-          data_sharding,
-      )
-
-      # Pad y to match X length along sequence dimension
-      if y_batch.shape[1] < X_batch.shape[1]:
-        y_batch = jnp.pad(
+        out = _predict_step_pytorch(
+            self.model,
+            X_batch,
             y_batch,
-            ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
-            constant_values=-100.0,
+            train_size_val,
+            ds_batch_val,
+            cat_mask_batch,
         )
+        # Slice output to keep only test predictions and unpadded batch.
+        out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
+        outputs.append(out)
+      return np.concatenate(outputs, axis=0)
 
-      if jax.process_index() == 0:
-        logging.info("X_batch shape: %s", X_batch.shape)
-        logging.info("y_batch shape: %s", y_batch.shape)
-        logging.info("train_size: %s", train_size_val)
-
-      # No gradient calculation needed for inference
-      if cat_mask_batch is not None and hasattr(self.model, "cell_embedder"):
-        cat_mask_batch = _pad_batch_to_multiple_of(cat_mask_batch, num_data_shards)
-        cat_mask_batch = jax.device_put(
-            jnp.array(cat_mask_batch, dtype=jnp.bool_), data_sharding
-        )
-        out = _predict_step_compiled(
-            self.model, X_batch, y_batch, train_size, d_batch, cat_mask_batch
-        )
+    else:
+      if not HAS_JAX:
+        raise ImportError("JAX is required to run a JAX model.")
+      # --- JAX execution path ---
+      mesh = jax.sharding.get_mesh()
+      if mesh and "data" in mesh.axis_names:
+        num_data_shards = mesh.axis_sizes[mesh.axis_names.index("data")]
+        data_sharding = NamedSharding(mesh, PartitionSpec("data"))
       else:
-        out = _predict_step_compiled(
-            self.model, X_batch, y_batch, train_size, d_batch
+        num_data_shards = 1
+        data_sharding = None
+
+      num_classes = self.n_classes_
+
+      _has_compiled_attr = (
+          "_predict_step_compiled_with_cat"
+          if (cat_masks is not None and hasattr(self.model, "cell_embedder"))
+          else "_predict_step_compiled_no_cat"
+      )
+
+      if not hasattr(self, _has_compiled_attr):
+        data_sharding = NamedSharding(
+            jax.sharding.Mesh(jax.devices(), ("data",)), PartitionSpec("data")
         )
 
-      # Slice output to keep only test predictions and unpadded batch.
-      out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
-      out = multihost_utils.process_allgather(out, tiled=True)
-      outputs.append(out)
+        if cat_masks is not None and hasattr(self.model, "cell_embedder"):
 
-    return np.concatenate(outputs, axis=0)
+          @nnx.jit(
+              in_shardings=(
+                  None,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+              ),
+              out_shardings=data_sharding,
+          )
+          def _predict_step_fn(model, X, y, train_size, d, cat_mask):
+            return model(
+                X,
+                y,
+                train_size=train_size,
+                d=d,
+                cat_mask=cat_mask,
+                num_classes=num_classes,
+            )
+
+        else:
+
+          @nnx.jit(
+              in_shardings=(
+                  None,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+              ),
+              out_shardings=data_sharding,
+          )
+          def _predict_step_fn(model, X, y, train_size, d):
+            return model(
+                X,
+                y,
+                train_size=train_size,
+                d=d,
+                num_classes=num_classes,
+            )
+
+        setattr(self, _has_compiled_attr, _predict_step_fn)
+
+      _predict_step_compiled = getattr(self, _has_compiled_attr)
+
+      batch_size_per_process = self.batch_size or Xs.shape[0]
+      n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
+      if n_batches > 1:
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        if cat_masks is not None:
+          cat_masks_split = np.array_split(cat_masks, n_batches)
+        if ds is not None:
+          ds_split = np.array_split(ds, n_batches)
+      else:
+        Xs_split = [Xs]
+        ys_split = [ys]
+        if cat_masks is not None:
+          cat_masks_split = [cat_masks]
+        if ds is not None:
+          ds_split = [ds]
+
+      outputs = []
+      cat_masks_iter = (
+          cat_masks_split if cat_masks is not None else [None] * len(Xs_split)
+      )
+      ds_iter = ds_split if ds is not None else [None] * len(Xs_split)
+      for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
+          Xs_split, ys_split, cat_masks_iter, ds_iter
+      ):
+        orig_batch_size = X_batch.shape[0]
+        orig_seq_len = X_batch.shape[1]
+
+        # Follow prefill(): pad sequence length T (n_row) to a multiple of 128
+        # with -100. Padded rows fall past train_size and are sliced off below.
+        _block_size = 128
+        _T_full = X_batch.shape[1]
+        _pad_len = ((_T_full - 1) // _block_size + 1) * _block_size - _T_full
+        if _pad_len > 0:
+          X_batch = np.pad(
+              X_batch, ((0, 0), (0, _pad_len), (0, 0)), constant_values=-100.0
+          )
+
+        X_batch = _pad_batch_to_multiple_of(X_batch, num_data_shards)
+        y_batch = _pad_batch_to_multiple_of(y_batch, num_data_shards)
+
+        X_batch = jax.device_put(
+            jnp.array(X_batch, dtype=jnp.float32), data_sharding
+        )
+        y_batch = jax.device_put(
+            jnp.array(y_batch, dtype=jnp.float32), data_sharding
+        )
+        batch_size_padded = X_batch.shape[0]
+        train_size_val = y_batch.shape[1]
+        train_size = jax.device_put(
+            jnp.repeat(train_size_val, batch_size_padded), data_sharding
+        )
+
+        if ds_batch_val is not None:
+          ds_batch = _pad_batch_to_multiple_of(
+              ds_batch_val, num_data_shards, constant_value=X_batch.shape[-1]
+          )
+        else:
+          ds_batch = np.full(
+              (batch_size_padded,), X_batch.shape[-1], dtype=np.int32
+          )
+
+        d_batch = jax.device_put(
+            jnp.array(ds_batch, dtype=np.int32),
+            data_sharding,
+        )
+
+        # Pad y to match X length along sequence dimension
+        if y_batch.shape[1] < X_batch.shape[1]:
+          y_batch = jnp.pad(
+              y_batch,
+              ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
+              constant_values=-100.0,
+          )
+
+        if jax.process_index() == 0:
+          logging.info("X_batch shape: %s", X_batch.shape)
+          logging.info("y_batch shape: %s", y_batch.shape)
+          logging.info("train_size: %s", train_size_val)
+
+        # No gradient calculation needed for inference
+        if cat_mask_batch is not None and hasattr(self.model, "cell_embedder"):
+          cat_mask_batch = _pad_batch_to_multiple_of(
+              cat_mask_batch, num_data_shards
+          )
+          cat_mask_batch = jax.device_put(
+              jnp.array(cat_mask_batch, dtype=jnp.bool_), data_sharding
+          )
+          out = _predict_step_compiled(
+              self.model, X_batch, y_batch, train_size, d_batch, cat_mask_batch
+          )
+        else:
+          out = _predict_step_compiled(
+              self.model, X_batch, y_batch, train_size, d_batch
+          )
+
+        # Slice output to keep only test predictions and unpadded batch.
+        out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
+        out = multihost_utils.process_allgather(out, tiled=True)
+        outputs.append(out)
+
+      return np.concatenate(outputs, axis=0)
 
   @jt.typed
-  def predict_oof_proba(self, cv: int = 5) -> jt.Float[jax.Array | np.ndarray, "E N K"]:
+  def predict_oof_proba(self, cv: int = 5) -> jt.Float[Array | np.ndarray, "E N K"]:
     """Perform out-of-fold predictions on the training set for each ensemble member."""
     check_is_fitted(self)
 
@@ -2354,8 +2474,8 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
   @jt.typed
   def _fit_calibration(
       self,
-      P: jt.Float[jax.Array | np.ndarray, "N K"],
-      y: jt.Int[jax.Array | np.ndarray, "N"],
+      P: jt.Float[Array | np.ndarray, "N K"],
+      y: jt.Int[Array | np.ndarray, "N"],
   ):
     """Fit calibration model on out-of-fold predictions.
 
@@ -2431,8 +2551,8 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
 
   @jt.typed
   def _apply_calibration(
-      self, P: jt.Float[jax.Array | np.ndarray, "N K"]
-  ) -> jt.Float[jax.Array | np.ndarray, "N K"]:
+      self, P: jt.Float[Array | np.ndarray, "N K"]
+  ) -> jt.Float[Array | np.ndarray, "N K"]:
     """Apply calibration model to predictions.
 
     Args:
@@ -2465,7 +2585,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     return P
 
   @jt.typed
-  def _predict_proba_internal(self, X: Any) -> jt.Float[jax.Array | np.ndarray, "E T K"]:
+  def _predict_proba_internal(self, X: Any) -> jt.Float[Array | np.ndarray, "E T K"]:
     """Predict class probabilities for test samples."""
     check_is_fitted(self)
     if isinstance(X, np.ndarray) and len(X.shape) == 1:
@@ -2521,7 +2641,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     return probs
 
   @jt.typed
-  def predict_proba(self, X: Any) -> jt.Float[jax.Array | np.ndarray, "T K"]:
+  def predict_proba(self, X: Any) -> jt.Float[Array | np.ndarray, "T K"]:
     """Predict class probabilities for test samples.
 
     Applies the ensemble of TabFM models to make predictions, with each
@@ -2813,11 +2933,11 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
   @jt.typed
   def _batch_forward(
       self,
-      Xs: jt.Float[jax.Array | np.ndarray, "B T H"],
-      ys: jt.Shaped[jax.Array | np.ndarray, "B T_train"],
-      cat_masks: Optional[jt.Bool[jax.Array | np.ndarray, "B H"]] = None,
-      ds: Optional[jt.Int[jax.Array | np.ndarray, "B"]] = None,
-  ) -> jt.Float[jax.Array | np.ndarray, "B T_test L_out"]:
+      Xs: jt.Float[Array | np.ndarray, "B T H"],
+      ys: jt.Shaped[Array | np.ndarray, "B T_train"],
+      cat_masks: Optional[jt.Bool[Array | np.ndarray, "B H"]] = None,
+      ds: Optional[jt.Int[Array | np.ndarray, "B"]] = None,
+  ) -> jt.Float[Array | np.ndarray, "B T_test L_out"]:
     """Process model forward passes in batches to manage memory efficiently.
 
     Args:
@@ -2835,166 +2955,231 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     Returns:
       Model outputs of shape (n_datasets, n_test, output_dim).
     """
-    mesh = jax.sharding.get_mesh()
-    if mesh and "data" in mesh.axis_names:
-      num_data_shards = mesh.axis_sizes[mesh.axis_names.index("data")]
-      data_sharding = NamedSharding(mesh, PartitionSpec("data"))
-    else:
-      num_data_shards = 1
-      data_sharding = None
+    is_torch = HAS_TORCH and isinstance(self.model, torch.nn.Module)
 
-    _has_compiled_attr = (
-        "_predict_step_compiled_with_cat"
-        if (cat_masks is not None and hasattr(self.model, "cell_embedder"))
-        else "_predict_step_compiled_no_cat"
-    )
-
-    if not hasattr(self, _has_compiled_attr):
-      data_sharding = NamedSharding(
-          jax.sharding.Mesh(jax.devices(), ("data",)), PartitionSpec("data")
-      )
-
-      if cat_masks is not None and hasattr(self.model, "cell_embedder"):
-
-        @nnx.jit(
-            in_shardings=(
-                None,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-            ),
-            out_shardings=data_sharding,
+    if is_torch:
+      # --- PyTorch execution path ---
+      batch_size_per_process = getattr(self, "batch_size", 1) or Xs.shape[0]
+      n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
+      if n_batches > 1:
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        cat_masks_split = (
+            np.array_split(cat_masks, n_batches)
+            if cat_masks is not None
+            else [None] * n_batches
         )
-        def _predict_step_fn(model, X, y, train_size, d, cat_mask):
-          return model(
-              X,
-              y,
-              train_size=train_size,
-              d=d,
-              cat_mask=cat_mask,
-          )
-
+        ds_split = (
+            np.array_split(ds, n_batches) if ds is not None else [None] * n_batches
+        )
       else:
-
-        @nnx.jit(
-            in_shardings=(
-                None,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-            ),
-            out_shardings=data_sharding,
-        )
-        def _predict_step_fn(model, X, y, train_size, d):
-          return model(
-              X,
-              y,
-              train_size=train_size,
-              d=d,
-          )
-
-      setattr(self, _has_compiled_attr, _predict_step_fn)
-
-    _predict_step_compiled = getattr(self, _has_compiled_attr)
-    batch_size_per_process = getattr(self, "batch_size", 1) or Xs.shape[0]
-    n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
-    if n_batches > 1:
-      Xs_split = np.array_split(Xs, n_batches)
-      ys_split = np.array_split(ys, n_batches)
-      if cat_masks is not None:
-        cat_masks_split = np.array_split(cat_masks, n_batches)
-      if ds is not None:
-        ds_split = np.array_split(ds, n_batches)
-    else:
-      Xs_split, ys_split = [Xs], [ys]
-      if cat_masks is not None:
+        Xs_split = [Xs]
+        ys_split = [ys]
         cat_masks_split = [cat_masks]
-      if ds is not None:
         ds_split = [ds]
 
-    outputs = []
-    cat_masks_iter = cat_masks_split if cat_masks is not None else [None] * len(Xs_split)
-    ds_iter = ds_split if ds is not None else [None] * len(Xs_split)
-    for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
-        Xs_split, ys_split, cat_masks_iter, ds_iter
-    ):
-      orig_batch_size = X_batch.shape[0]
-      orig_seq_len = X_batch.shape[1]
+      outputs = []
+      for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
+          Xs_split, ys_split, cat_masks_split, ds_split
+      ):
+        orig_batch_size = X_batch.shape[0]
+        orig_seq_len = X_batch.shape[1]
+        train_size_val = y_batch.shape[1]
 
-      # Follow prefill(): pad sequence length T (n_row) to a multiple of 128
-      # with -100. Padded rows fall past train_size and are sliced off below.
-      _block_size = 128
-      _T_full = X_batch.shape[1]
-      _pad_len = ((_T_full - 1) // _block_size + 1) * _block_size - _T_full
-      if _pad_len > 0:
-        X_batch = np.pad(
-            X_batch, ((0, 0), (0, _pad_len), (0, 0)), constant_values=-100.0
-        )
+        # Pad y to match X length along sequence dimension if needed
+        if y_batch.shape[1] < X_batch.shape[1]:
+          y_batch = np.pad(
+              y_batch,
+              ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
+              mode="constant",
+              constant_values=-100.0,
+          )
 
-      X_batch = _pad_batch_to_multiple_of(X_batch, num_data_shards)
-      y_batch = _pad_batch_to_multiple_of(y_batch, num_data_shards)
-
-      X_batch = jax.device_put(jnp.array(X_batch, dtype=jnp.float32), data_sharding)
-      y_batch = jax.device_put(jnp.array(y_batch, dtype=jnp.float32), data_sharding)
-      batch_size_padded = X_batch.shape[0]
-      train_size_val = y_batch.shape[1]
-      train_size = jax.device_put(
-          jnp.repeat(train_size_val, batch_size_padded), data_sharding
-      )
-
-      if ds_batch_val is not None:
-        ds_batch = _pad_batch_to_multiple_of(
-            ds_batch_val, num_data_shards, constant_value=X_batch.shape[-1]
-        )
-      else:
-        ds_batch = np.full(
-            (batch_size_padded,), X_batch.shape[-1], dtype=np.int32
-        )
-
-      d_batch = jax.device_put(
-          jnp.array(ds_batch, dtype=jnp.int32), data_sharding
-      )
-
-      if y_batch.shape[1] < X_batch.shape[1]:
-        y_batch = jnp.pad(
+        out = _predict_step_pytorch(
+            self.model,
+            X_batch,
             y_batch,
-            ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
-            constant_values=-100.0,
+            train_size_val,
+            ds_batch_val,
+            cat_mask_batch,
         )
+        # Slice output to keep only test predictions and unpadded batch.
+        out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
+        outputs.append(out)
+      return np.concatenate(outputs, axis=0)
 
-      if jax.process_index() == 0:
-        logging.info("X_batch shape: %s", X_batch.shape)
-        logging.info("y_batch shape: %s", y_batch.shape)
-        logging.info("train_size: %s", train_size_val)
-
-      if cat_mask_batch is not None and hasattr(self.model, "cell_embedder"):
-        cat_mask_batch = _pad_batch_to_multiple_of(cat_mask_batch, num_data_shards)
-        cat_mask_batch = jax.device_put(
-            jnp.array(cat_mask_batch, dtype=jnp.bool_), data_sharding
-        )
-        out = _predict_step_compiled(
-            self.model, X_batch, y_batch, train_size, d_batch, cat_mask_batch
-        )
+    else:
+      if not HAS_JAX:
+        raise ImportError("JAX is required to run a JAX model.")
+      # --- JAX execution path ---
+      mesh = jax.sharding.get_mesh()
+      if mesh and "data" in mesh.axis_names:
+        num_data_shards = mesh.axis_sizes[mesh.axis_names.index("data")]
+        data_sharding = NamedSharding(mesh, PartitionSpec("data"))
       else:
-        out = _predict_step_compiled(
-            self.model, X_batch, y_batch, train_size, d_batch
+        num_data_shards = 1
+        data_sharding = None
+
+      _has_compiled_attr = (
+          "_predict_step_compiled_with_cat"
+          if (cat_masks is not None and hasattr(self.model, "cell_embedder"))
+          else "_predict_step_compiled_no_cat"
+      )
+
+      if not hasattr(self, _has_compiled_attr):
+        data_sharding = NamedSharding(
+            jax.sharding.Mesh(jax.devices(), ("data",)), PartitionSpec("data")
         )
 
-      out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
-      out = multihost_utils.process_allgather(out, tiled=True)
-      outputs.append(out)
+        if cat_masks is not None and hasattr(self.model, "cell_embedder"):
 
-    return np.concatenate(outputs, axis=0)
+          @nnx.jit(
+              in_shardings=(
+                  None,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+              ),
+              out_shardings=data_sharding,
+          )
+          def _predict_step_fn(model, X, y, train_size, d, cat_mask):
+            return model(
+                X,
+                y,
+                train_size=train_size,
+                d=d,
+                cat_mask=cat_mask,
+            )
+
+        else:
+
+          @nnx.jit(
+              in_shardings=(
+                  None,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+              ),
+              out_shardings=data_sharding,
+          )
+          def _predict_step_fn(model, X, y, train_size, d):
+            return model(
+                X,
+                y,
+                train_size=train_size,
+                d=d,
+            )
+
+        setattr(self, _has_compiled_attr, _predict_step_fn)
+
+      _predict_step_compiled = getattr(self, _has_compiled_attr)
+      batch_size_per_process = getattr(self, "batch_size", 1) or Xs.shape[0]
+      n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
+      if n_batches > 1:
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        if cat_masks is not None:
+          cat_masks_split = np.array_split(cat_masks, n_batches)
+        if ds is not None:
+          ds_split = np.array_split(ds, n_batches)
+      else:
+        Xs_split, ys_split = [Xs], [ys]
+        if cat_masks is not None:
+          cat_masks_split = [cat_masks]
+        if ds is not None:
+          ds_split = [ds]
+
+      outputs = []
+      cat_masks_iter = (
+          cat_masks_split if cat_masks is not None else [None] * len(Xs_split)
+      )
+      ds_iter = ds_split if ds is not None else [None] * len(Xs_split)
+      for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
+          Xs_split, ys_split, cat_masks_iter, ds_iter
+      ):
+        orig_batch_size = X_batch.shape[0]
+        orig_seq_len = X_batch.shape[1]
+
+        # Follow prefill(): pad sequence length T (n_row) to a multiple of 128
+        # with -100. Padded rows fall past train_size and are sliced off below.
+        _block_size = 128
+        _T_full = X_batch.shape[1]
+        _pad_len = ((_T_full - 1) // _block_size + 1) * _block_size - _T_full
+        if _pad_len > 0:
+          X_batch = np.pad(
+              X_batch, ((0, 0), (0, _pad_len), (0, 0)), constant_values=-100.0
+          )
+
+        X_batch = _pad_batch_to_multiple_of(X_batch, num_data_shards)
+        y_batch = _pad_batch_to_multiple_of(y_batch, num_data_shards)
+
+        X_batch = jax.device_put(
+            jnp.array(X_batch, dtype=jnp.float32), data_sharding
+        )
+        y_batch = jax.device_put(
+            jnp.array(y_batch, dtype=jnp.float32), data_sharding
+        )
+        batch_size_padded = X_batch.shape[0]
+        train_size_val = y_batch.shape[1]
+        train_size = jax.device_put(
+            jnp.repeat(train_size_val, batch_size_padded), data_sharding
+        )
+
+        if ds_batch_val is not None:
+          ds_batch = _pad_batch_to_multiple_of(
+              ds_batch_val, num_data_shards, constant_value=X_batch.shape[-1]
+          )
+        else:
+          ds_batch = np.full(
+              (batch_size_padded,), X_batch.shape[-1], dtype=np.int32
+          )
+
+        d_batch = jax.device_put(
+            jnp.array(ds_batch, dtype=jnp.int32), data_sharding
+        )
+
+        if y_batch.shape[1] < X_batch.shape[1]:
+          y_batch = jnp.pad(
+              y_batch,
+              ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
+              constant_values=-100.0,
+          )
+
+        if jax.process_index() == 0:
+          logging.info("X_batch shape: %s", X_batch.shape)
+          logging.info("y_batch shape: %s", y_batch.shape)
+          logging.info("train_size: %s", train_size_val)
+
+        if cat_mask_batch is not None and hasattr(self.model, "cell_embedder"):
+          cat_mask_batch = _pad_batch_to_multiple_of(
+              cat_mask_batch, num_data_shards
+          )
+          cat_mask_batch = jax.device_put(
+              jnp.array(cat_mask_batch, dtype=jnp.bool_), data_sharding
+          )
+          out = _predict_step_compiled(
+              self.model, X_batch, y_batch, train_size, d_batch, cat_mask_batch
+          )
+        else:
+          out = _predict_step_compiled(
+              self.model, X_batch, y_batch, train_size, d_batch
+          )
+
+        out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
+        out = multihost_utils.process_allgather(out, tiled=True)
+        outputs.append(out)
+
+      return np.concatenate(outputs, axis=0)
 
   def _inverse_transform_y(self, y_scaled: np.ndarray) -> np.ndarray:
     """Inverse transform target values."""
     return self.y_scaler_.inverse_transform(y_scaled.reshape(-1, 1)).flatten()
 
   @jt.typed
-  def predict_oof(self, cv: int = 5) -> jt.Float[jax.Array | np.ndarray, "E N"]:
+  def predict_oof(self, cv: int = 5) -> jt.Float[Array | np.ndarray, "E N"]:
     """Perform out-of-fold predictions on the training set for each ensemble member."""
     check_is_fitted(self)
 
@@ -3071,7 +3256,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     return outputs_oof
 
   @jt.typed
-  def _predict_internal(self, X: Any) -> jt.Float[jax.Array | np.ndarray, "E T"]:
+  def _predict_internal(self, X: Any) -> jt.Float[Array | np.ndarray, "E T"]:
     """Predict regression target for test samples."""
     if isinstance(X, np.ndarray) and len(X.shape) == 1:
       raise ValueError("The provided input X is one-dimensional. Reshape your data.")
@@ -3092,8 +3277,8 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
 
   @jt.typed
   def _combine_predictions(
-      self, predictions_scaled: jt.Float[jax.Array | np.ndarray, "E T"]
-  ) -> jt.Float[jax.Array | np.ndarray, "T"]:
+      self, predictions_scaled: jt.Float[Array | np.ndarray, "E T"]
+  ) -> jt.Float[Array | np.ndarray, "T"]:
     """Combine scaled predictions from ensemble members into final prediction."""
     n_est = predictions_scaled.shape[0]
     if self.enable_nnls:
@@ -3106,7 +3291,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       return self._inverse_transform_y(avg_predictions)
 
   @jt.typed
-  def predict(self, X: Any) -> jt.Float[jax.Array | np.ndarray, "T"]:
+  def predict(self, X: Any) -> jt.Float[Array | np.ndarray, "T"]:
     """Predict regression target for test samples.
 
     Applies the ensemble of TabFM models to make predictions, with each

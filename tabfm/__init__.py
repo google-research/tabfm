@@ -14,7 +14,12 @@
 
 """tabfm API."""
 
-from tabfm.src import tabfm_v1_0_0
+try:
+  from tabfm.src.jax import tabfm_v1_0_0
+except ImportError:
+  # JAX is not installed or incomplete, tabfm_v1_0_0 (JAX version) is not available.
+  pass
+
 from tabfm.src.classifier_and_regressor import TabFMClassifier, TabFMRegressor
 
 # A new PyPI release will be pushed every time `__version__` is increased.

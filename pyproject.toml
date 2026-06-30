@@ -38,6 +38,7 @@ dependencies = [
     "scipy",
     "typeguard<3",
     "huggingface-hub",
+    "torch",
 ]
 
 # `version` is automatically set by flit to use `tabfm.__version__`

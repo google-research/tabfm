@@ -20,8 +20,8 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tabfm.src import model as tabfm_model
-from tabfm.src.model import AttentionImplementation, YEmbeddingScheme
+from tabfm.src.jax import model as tabfm_model
+from tabfm.src.jax.model import AttentionImplementation, YEmbeddingScheme
 
 from absl.testing import absltest
 from absl.testing import parameterized

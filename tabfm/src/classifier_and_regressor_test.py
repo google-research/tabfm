@@ -12,12 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import unittest
 from unittest import mock
 from absl.testing import absltest
-from flax import nnx
 import numpy as np
 import pandas as pd
-from tabfm.src import model as tabfm_model
+
+try:
+  from flax import nnx
+  from tabfm.src.jax import model as tabfm_model
+  HAS_JAX = True
+except ImportError:
+  HAS_JAX = False
 from tabfm.src.classifier_and_regressor import EnsembleGenerator
 from tabfm.src.classifier_and_regressor import TabFMClassifier
 from tabfm.src.classifier_and_regressor import TabFMRegressor
@@ -269,6 +275,7 @@ class EnsembleGeneratorTest(absltest.TestCase):
     self.assertEqual(X_out.shape[2], 7)
 
 
+@unittest.skipUnless(HAS_JAX, "JAX is required")
 class OOFPredictionTest(absltest.TestCase):
 
   def test_classifier_predict_oof_proba(self):
@@ -532,6 +539,7 @@ class OOFPredictionTest(absltest.TestCase):
       self.assertTrue(mock_batch_forward.called)
 
 
+@unittest.skipUnless(HAS_JAX, "JAX is required")
 class BatchForwardTest(absltest.TestCase):
 
   def test_classifier_batch_forward(self):
@@ -635,6 +643,7 @@ class BatchForwardTest(absltest.TestCase):
     self.assertEqual(outputs.shape, (4, 4, 10))
 
 
+@unittest.skipUnless(HAS_JAX, "JAX is required")
 class CalibrationTest(absltest.TestCase):
 
   def setUp(self):
@@ -728,6 +737,7 @@ class CalibrationTest(absltest.TestCase):
         self.assertEqual(probs.shape, (150, 3))
 
 
+@unittest.skipUnless(HAS_JAX, "JAX is required")
 class StackingTest(absltest.TestCase):
 
   def setUp(self):
@@ -970,6 +980,7 @@ class EnsemblePresetTest(absltest.TestCase):
     self.assertIsNone(clf.binary_calibration_method)
 
 
+@unittest.skipUnless(HAS_JAX, "JAX is required")
 class LabelEncodingTest(absltest.TestCase):
 
   def test_classes_are_alphabetical(self):

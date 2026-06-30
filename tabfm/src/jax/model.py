@@ -1025,6 +1025,7 @@ class InducedSelfAttentionBlock(nnx.Module):
         'attention_impl': attention_impl,
         'zero_out_proj_init': zero_out_proj_init,
         'use_bias': use_bias,
+        'dtype': dtype,
     }
     self.mab1 = MultiheadAttentionBlock(**block_args)
     self.mab2 = MultiheadAttentionBlock(**block_args)

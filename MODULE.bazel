@@ -11,7 +11,7 @@ pip.parse(
     hub_name = "pip",
     python_version = "3.11",
     requirements_lock = "//:requirements.txt",
-    extra_pip_args = ["--index-url", "https://pypi.org/simple/"],
+    extra_pip_args = ["--index-url", "https://pypi.org/simple/", "--extra-index-url", "https://download.pytorch.org/whl/cpu"],
 )
 
 use_repo(pip, "pip")

@@ -18,8 +18,8 @@ import chex
 from flax import nnx
 import jax.numpy as jnp
 import optax
-from tabfm.src import checkpointing
-from tabfm.src import model as tabfm_model
+from tabfm.src.jax import checkpointing
+from tabfm.src.jax import model as tabfm_model
 
 from absl.testing import absltest
 
