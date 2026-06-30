@@ -1819,7 +1819,7 @@ def _predict_step_pytorch(
   with torch.no_grad():
     out_t = model(X_t, y_t, train_size_t, cat_mask=cat_mask_t, d=d_t)
 
-  return out_t.cpu().numpy()
+  return out_t.float().cpu().numpy()  # upcast: numpy has no bfloat16
 
 
 # ---------------------------------------------------------------------------

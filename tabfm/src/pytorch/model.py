@@ -442,6 +442,11 @@ class TabFM(nn.Module):
                                     decoder_hidden or icl_dim * 2, is_classifier)
 
   def forward(self, x, y, train_size, cat_mask=None, d=None):
+    # Mirror the JAX model's entry: replace NaN with the -100 sentinel and cast
+    # to the compute dtype (JAX: `jnp.nan_to_num(X, nan=-100.0).astype(self.dtype)`).
+    # NaN is already imputed in the shared preprocessing, so nan_to_num is a
+    # no-op in the normal flow, but it keeps the model robust + JAX-faithful.
+    x = torch.nan_to_num(x, nan=-100.0).to(self.cls_tokens.dtype)
     emb = self.cell_embedder(x, y, train_size, cat_mask, d=d)
     emb = self.col_embedder(emb, train_size)
     b, t, _, e = emb.shape

@@ -74,10 +74,17 @@ def load(
     checkpoint_path: Optional[str] = None,
     *,
     device: Optional[str] = None,
+    dtype: Any = torch.bfloat16,
     use_cache: bool = True,
 ) -> TabFM:
-  """Loads the PyTorch TabFM v1.0.0 model with pre-trained weights."""
-  cache_key = (model_type, checkpoint_path, device)
+  """Loads the PyTorch TabFM v1.0.0 model with pre-trained weights.
+
+  The checkpoint is stored in float32, but the model is designed to run in
+  bfloat16 (matching the JAX release's ``dtype=jnp.bfloat16`` compute default),
+  with a few internal fp32 upcasts. ``dtype`` casts the model accordingly; pass
+  ``None`` to keep the float32 weights.
+  """
+  cache_key = (model_type, checkpoint_path, device, str(dtype))
   
   if use_cache:
     _LOAD_CACHE_LOCK.acquire()
@@ -118,6 +125,9 @@ def load(
     logging.info("Loading PyTorch state dict from %s...", checkpoint_file)
     state_dict = torch.load(checkpoint_file, map_location="cpu")
     model.load_state_dict(state_dict, strict=True)
+
+    if dtype is not None:
+      model = model.to(dtype)  # engage the bf16 compute design (see docstring)
 
     if device is not None:
       model = model.to(device)
