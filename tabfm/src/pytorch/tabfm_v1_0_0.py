@@ -83,6 +83,9 @@ def load(
   bfloat16 (matching the JAX release's ``dtype=jnp.bfloat16`` compute default),
   with a few internal fp32 upcasts. ``dtype`` casts the model accordingly; pass
   ``None`` to keep the float32 weights.
+
+  ``dtype`` is provided for float32 debugging / quality comparison; the model is
+  designed for bfloat16 and this option may be removed in a future release.
   """
   cache_key = (model_type, checkpoint_path, device, str(dtype))
   
