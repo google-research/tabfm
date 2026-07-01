@@ -490,7 +490,9 @@ class TabFM(
 
     # translate root-level config keys already merged into model_kwargs
     if "is_classifier" not in model_kwargs and "task" in model_kwargs:
-      model_kwargs["is_classifier"] = model_kwargs.pop("task") == "classification"
+      model_kwargs["is_classifier"] = (
+          model_kwargs.pop("task") == "classification"
+      )
     for key in ("model_type", "version", "framework"):
       model_kwargs.pop(key, None)
 
@@ -529,9 +531,14 @@ class TabFM(
     # hub repo: fetch subfolder config.json then weights
     try:
       cfg_file = hf_hub_download(
-          repo_id=model_id, filename=constants.CONFIG_NAME, subfolder=subfolder,
-          revision=revision, cache_dir=cache_dir, force_download=force_download,
-          token=token, local_files_only=local_files_only,
+          repo_id=model_id,
+          filename=constants.CONFIG_NAME,
+          subfolder=subfolder,
+          revision=revision,
+          cache_dir=cache_dir,
+          force_download=force_download,
+          token=token,
+          local_files_only=local_files_only,
       )
       with open(cfg_file) as f:
         _clean_config(_json.load(f))
@@ -539,16 +546,25 @@ class TabFM(
       pass
 
     model = cls(**model_kwargs)
-    for filename in (constants.SAFETENSORS_SINGLE_FILE, constants.PYTORCH_WEIGHTS_NAME):
+    for filename in (
+        constants.SAFETENSORS_SINGLE_FILE,
+        constants.PYTORCH_WEIGHTS_NAME,
+    ):
       try:
         wt_file = hf_hub_download(
-            repo_id=model_id, filename=filename, subfolder=subfolder,
-            revision=revision, cache_dir=cache_dir, force_download=force_download,
-            token=token, local_files_only=local_files_only,
+            repo_id=model_id,
+            filename=filename,
+            subfolder=subfolder,
+            revision=revision,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            token=token,
+            local_files_only=local_files_only,
         )
         if filename == constants.SAFETENSORS_SINGLE_FILE:
           return cls._load_as_safetensor(model, wt_file, map_location, strict)
         import torch as _torch
+
         model.load_state_dict(
             _torch.load(wt_file, map_location=map_location, weights_only=True),
             strict=strict,
