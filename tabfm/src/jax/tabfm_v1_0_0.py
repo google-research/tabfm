@@ -27,6 +27,7 @@ from absl import logging
 from flax import nnx
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
+from huggingface_hub import ModelHubMixin, snapshot_download
 from tabfm.src.jax import checkpointing
 from tabfm.src.jax.model import TabFM, YEmbeddingScheme
 
@@ -106,22 +107,127 @@ class RegressionConfig(Config):
   loss: str = "rmse"
 
 
-# Process-wide memo of restored models. Caching avoids re-running the Orbax
-# checkpoint restore on every call (e.g. AutoGluon / TabArena bagging fits many
-# child models in one process); the restored weights are immutable and shared
-# safely across callers.
-#
-# It is a dict keyed by load settings (model_type, checkpoint_path, step,
-# col/row/icl attention impls, dtype) rather than a single slot for two reasons:
-#   1. Distinct variants can coexist in one process -- most commonly the
-#      classification and regression models -- so a single slot would evict
-#      one whenever the other is loaded and re-pay the restore each switch.
-#   2. Correctness: these settings change which weights/architecture you get,
-#      so the key guarantees we never return a model loaded with settings
-#      different from those requested. (Equivalent to functools.lru_cache on
-#      the arguments; kept explicit for the use_cache=False escape hatch.)
+def _restore_from_dir(
+    model: TabFM,
+    checkpoint_path: str,
+    model_type: str,
+    step: Optional[int],
+) -> TabFM:
+  """Restores Orbax checkpoint into model in place and returns model."""
+  if not os.path.exists(os.path.join(checkpoint_path, "orbax")):
+    potential_path = os.path.join(checkpoint_path, model_type)
+    if os.path.exists(os.path.join(potential_path, "orbax")):
+      checkpoint_path = potential_path
+
+  checkpoint_manager = checkpointing.create_checkpoint_manager(
+      checkpoint_path, read_only=True
+  )
+  if step is None:
+    step = checkpoint_manager.latest_step()
+    if step is None:
+      raise ValueError(f"No checkpoints found in {checkpoint_path}/orbax")
+
+  state = nnx.state(model)
+  restored = checkpoint_manager.restore(
+      step,
+      args=ocp.args.Composite(
+          params=ocp.args.StandardRestore(state, strict=False)
+      ),
+  )
+  nnx.update(model, restored["params"])
+  return model
+
+
+class TabFM_HF(TabFM, ModelHubMixin):
+  """JAX TabFM model with HuggingFace Hub support.
+
+  Subclasses TabFM directly rather than wrapping it, since NNX has special
+  handling for nnx.Module subclasses that a wrapper breaks under JIT.
+  Provides from_pretrained(), save_pretrained(), and push_to_hub() via
+  ModelHubMixin.
+  """
+
+  def __init__(self, *args, model_type: str = "classification", **kwargs):
+    super().__init__(*args, **kwargs)
+    object.__setattr__(self, "_model_type", model_type)
+
+  def __setattr__(self, name: str, value: Any):
+    if name in ("_hub_mixin_config", "_model_type"):
+      # Bypass NNX checking entirely and write directly to Python's object dict.
+      object.__setattr__(self, name, value)
+    else:
+      super().__setattr__(name, value)
+
+  @classmethod
+  def _from_pretrained(
+      cls,
+      *,
+      model_id: str,
+      revision: Optional[str],
+      cache_dir,
+      force_download: bool,
+      local_files_only: bool,
+      token,
+      model_type: str = "classification",
+      step: Optional[int] = None,
+      col_attention_impl: str = "flash",
+      row_attention_impl: str = "jax",
+      icl_attention_impl: str = "flash",
+      dtype: Any = jnp.bfloat16,
+      **kwargs,
+  ) -> "TabFM_HF":
+    from tabfm.src.jax.model import AttentionImplementation  # pylint: disable=g-import-not-at-top
+
+    if model_type == "classification":
+      config = ClassificationConfig()
+    elif model_type == "regression":
+      config = RegressionConfig()
+    else:
+      raise ValueError(
+          f"Unsupported model_type: {model_type!r}. "
+          "Must be 'classification' or 'regression'."
+      )
+
+    config_dict = config.to_dict()
+    config_dict["col_attention_impl"] = AttentionImplementation(col_attention_impl)
+    config_dict["row_attention_impl"] = AttentionImplementation(row_attention_impl)
+    config_dict["icl_attention_impl"] = AttentionImplementation(icl_attention_impl)
+
+    model = cls(rngs=nnx.Rngs(0), dtype=dtype, model_type=model_type, **config_dict)
+
+    if os.path.isdir(model_id):
+      checkpoint_path = model_id
+    else:
+      logging.info(
+          "Downloading TabFM v1.0.0 JAX %s weights from Hugging Face...",
+          model_type,
+      )
+      base_path = snapshot_download(
+          repo_id=model_id,
+          revision=revision,
+          cache_dir=cache_dir,
+          force_download=force_download,
+          local_files_only=local_files_only,
+          token=token,
+          allow_patterns=[f"{model_type}/**"],
+      )
+      checkpoint_path = os.path.join(base_path, model_type)
+
+    return _restore_from_dir(model, checkpoint_path, model_type, step)
+
+  def _save_pretrained(self, save_directory):
+    """Save Orbax checkpoint to save_directory/<model_type>/orbax/."""
+    out_path = os.path.join(save_directory, self._model_type)
+    os.makedirs(out_path, exist_ok=True)
+    manager = checkpointing.create_checkpoint_manager(out_path, read_only=False)
+    state = nnx.state(self)
+    manager.save(0, args=ocp.args.Composite(params=ocp.args.StandardSave(state)))
+    manager.wait_until_finished()
+
+
+# Process-wide memo of restored models (shared by load() and TabFM_HF).
 _LOAD_CACHE_LOCK = threading.Lock()
-_LOAD_CACHE: Dict[Any, "TabFM"] = {}
+_LOAD_CACHE: Dict[Any, "TabFM_HF"] = {}
 
 
 def load(
@@ -129,116 +235,60 @@ def load(
     checkpoint_path: Optional[str] = None,
     step: Optional[int] = None,
     *,
-    col_attention_impl: str = 'flash',
-    row_attention_impl: str = 'jax',
-    icl_attention_impl: str = 'flash',
+    col_attention_impl: str = "flash",
+    row_attention_impl: str = "jax",
+    icl_attention_impl: str = "flash",
     dtype: Any = jnp.bfloat16,
     use_cache: bool = True,
-) -> TabFM:
-  """Loads the TabFM v1.0.0 model with pre-trained weights.
+) -> "TabFM_HF":
+  """Loads the TabFM v1.0.0 JAX model with pre-trained weights.
 
-  If `checkpoint_path` is not provided, it will attempt to download the weights
-  from Hugging Face (google/tabfm-v1-0-0). If provided, it will load from the
-  specified local directory containing the Orbax checkpoint.
+  If `checkpoint_path` is not provided, downloads weights from Hugging Face
+  (google/tabfm-1.0.0-jax), fetching only the requested model_type subfolder.
 
   Args:
-    model_type: Type of model to load ('classification' or 'regression').
-    checkpoint_path: Local directory containing the 'orbax/' checkpoint, or None
-      to download from Hugging Face.
-    step: The checkpoint step to restore (for local loading).
-    col_attention_impl: Attention implementation for the column-attention layers
-      ('jax', 'flash', etc.). Defaults to 'flash'; column attention can run over
-      up to ``max_num_features`` columns, so flash keeps memory bounded for wide
-      datasets (negligible overhead for narrow ones).
-    row_attention_impl: Attention implementation for the row-attention layers.
-      Defaults to 'jax' (row attention is over a handful of CLS tokens, so flash
-      would be pure overhead).
-    icl_attention_impl: Attention implementation for the in-context (ICL) layers
-      ('jax', 'flash', etc.). Defaults to 'flash' since ICL attention runs over
-      the full row context and is the memory-critical path for large datasets.
-    dtype: Calculations dtype for JAX.
-    use_cache: If True (default), reuse a process-wide cached model when one was
-      already loaded with identical settings. Set False to force a fresh load.
+    model_type: 'classification' or 'regression'.
+    checkpoint_path: Local directory containing the 'orbax/' checkpoint, or
+      None to download from Hugging Face.
+    step: Checkpoint step to restore (for local loading).
+    col_attention_impl: Attention impl for column-attention layers ('jax' or
+      'flash').
+    row_attention_impl: Attention impl for row-attention layers.
+    icl_attention_impl: Attention impl for ICL layers.
+    dtype: JAX compute dtype.
+    use_cache: Reuse a process-wide cached model for identical settings.
 
   Returns:
-    An initialized TabFM model with restored weights.
+    The restored TabFM_HF model.
   """
   cache_key = (
-      model_type, checkpoint_path, step,
-      col_attention_impl, row_attention_impl, icl_attention_impl, str(dtype),
+      model_type,
+      checkpoint_path,
+      step,
+      col_attention_impl,
+      row_attention_impl,
+      icl_attention_impl,
+      str(dtype),
   )
   if use_cache:
     _LOAD_CACHE_LOCK.acquire()
-
   try:
     if use_cache and cache_key in _LOAD_CACHE:
       return _LOAD_CACHE[cache_key]
 
-    from tabfm.src.jax.model import AttentionImplementation
-
-    # 1. Instantiate model with hardcoded config based on model_type
-    if model_type == "classification":
-      config = ClassificationConfig()
-    elif model_type == "regression":
-      config = RegressionConfig()
-    else:
-      raise ValueError(
-          f"Unsupported model_type: {model_type}. Must be 'classification' or"
-          " 'regression'."
-      )
-
-    rngs = nnx.Rngs(0)
-    config_dict = config.to_dict()
-    config_dict['col_attention_impl'] = AttentionImplementation(col_attention_impl)
-    config_dict['row_attention_impl'] = AttentionImplementation(row_attention_impl)
-    config_dict['icl_attention_impl'] = AttentionImplementation(icl_attention_impl)
-    model = TabFM(rngs=rngs, dtype=dtype, **config_dict)
-
-    # 2. Get checkpoint directory
-    if checkpoint_path is None:
-      # Download from Hugging Face
-      try:
-        from huggingface_hub import snapshot_download  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
-
-        logging.info(
-            "Downloading TabFM v1.0.0 %s weights from Hugging Face...", model_type
-        )
-        base_path = snapshot_download(repo_id=HF_REPO_ID)
-        checkpoint_path = os.path.join(base_path, model_type)
-      except ImportError as e:
-        raise ImportError(
-            "huggingface_hub is required to download weights. "
-            "Install it using 'pip install huggingface_hub' or provide a "
-            "local checkpoint_path."
-        ) from e
-    else:
-      # If local root checkpoint path is provided, try appending model_type
-      if not os.path.exists(os.path.join(checkpoint_path, "orbax")):
-        potential_path = os.path.join(checkpoint_path, model_type)
-        if os.path.exists(os.path.join(potential_path, "orbax")):
-          checkpoint_path = potential_path
-
-    # 3. Restore parameters from local/downloaded path
-    checkpoint_manager = checkpointing.create_checkpoint_manager(
-        checkpoint_path, read_only=True
+    result = TabFM_HF.from_pretrained(
+        HF_REPO_ID if checkpoint_path is None else checkpoint_path,
+        model_type=model_type,
+        step=step,
+        col_attention_impl=col_attention_impl,
+        row_attention_impl=row_attention_impl,
+        icl_attention_impl=icl_attention_impl,
+        dtype=dtype,
     )
-    if step is None:
-      step = checkpoint_manager.latest_step()
-      if step is None:
-        raise ValueError(f"No checkpoints found in {checkpoint_path}/orbax")
-
-    state = nnx.state(model)
-    restored = checkpoint_manager.restore(
-        step,
-        args=ocp.args.Composite(
-            params=ocp.args.StandardRestore(state, strict=False)
-        ),
-    )
-    nnx.update(model, restored["params"])
 
     if use_cache:
-      _LOAD_CACHE[cache_key] = model
-    return model
+      _LOAD_CACHE[cache_key] = result
+    return result
   finally:
     if use_cache:
       _LOAD_CACHE_LOCK.release()
