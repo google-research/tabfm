@@ -417,6 +417,18 @@ class ICLearning(nn.Module):
     return self.decoder(self.ln(out))
 
 
+# Always-on activation-chunk sizes. TabFM runs the whole training fold as one
+# in-context sequence, so a single forward materialises activations that grow
+# with rows * features and OOM the GPU on large tasks. These sizes split each
+# stage's largest activation along an independent axis, bounding peak memory.
+# Chunking is exact (identical outputs) and a no-op when an input is smaller
+# than the chunk size, and it costs <1% runtime otherwise, so it is always on.
+# Sizes are chosen for memory safety on a 40 GB GPU across TabArena-scale tasks.
+_ROW_CHUNK_SIZE = 4096   # rows per chunk (Fourier cell embedding + row interaction)
+_COL_CHUNK_SIZE = 16     # feature-instances per chunk (column set-transformer)
+_FFN_CHUNK_SIZE = 8192   # tokens per chunk (feed-forward expansion in every block)
+
+
 class TabFM(nn.Module):
   def __init__(self, *, embed_dim=8, max_classes=3, col_num_blocks=2,
                col_nhead=2, col_num_inds=4, row_num_blocks=2, row_nhead=2,
@@ -440,6 +452,16 @@ class TabFM(nn.Module):
     self.icl_predictor = ICLearning(icl_dim, icl_num_blocks, icl_nhead, max_classes,
                                     icl_dim * ff_factor,
                                     decoder_hidden or icl_dim * 2, is_classifier)
+
+    # Enable activation chunking by default (see the module constants above).
+    # The per-block knobs stay settable (e.g. to None) for benchmarking.
+    for module in self.modules():
+      if hasattr(module, "row_chunk_size"):
+        module.row_chunk_size = _ROW_CHUNK_SIZE
+      if hasattr(module, "col_chunk_size"):
+        module.col_chunk_size = _COL_CHUNK_SIZE
+      if hasattr(module, "ffn_chunk_size"):
+        module.ffn_chunk_size = _FFN_CHUNK_SIZE
 
   def forward(self, x, y, train_size, cat_mask=None, d=None):
     emb = self.cell_embedder(x, y, train_size, cat_mask, d=d)
