@@ -56,6 +56,11 @@ jax = [
 pytorch = [
     "torch",
 ]
+# MLX backend. Runs on Apple silicon's unified memory (Metal); recent MLX
+# releases also ship CPU/CUDA wheels for Linux.
+mlx = [
+    "mlx",
+]
 
 # Development deps (unittest, linting, formating,...)
 # Installed through `pip install -e .[dev]`

@@ -27,6 +27,12 @@ except ImportError:
   # PyTorch is not installed or incomplete, tabfm_v1_0_0_pytorch is not available.
   pass
 
+try:
+  from tabfm.src.mlx import tabfm_v1_0_0 as tabfm_v1_0_0_mlx
+except ImportError:
+  # MLX is not installed or incomplete, tabfm_v1_0_0_mlx is not available.
+  pass
+
 from tabfm.src.classifier_and_regressor import TabFMClassifier, TabFMRegressor
 
 # A new PyPI release will be pushed every time `__version__` is increased.

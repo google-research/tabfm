@@ -33,6 +33,7 @@ from absl import flags
 # backend is not installed.
 _has_torch = importlib.util.find_spec("torch") is not None
 _has_jax = importlib.util.find_spec("jax") is not None
+_has_mlx = importlib.util.find_spec("mlx") is not None
 collect_ignore = []
 if not _has_torch:
   collect_ignore.append("tabfm/src/classifier_and_regressor_pytorch_test.py")
@@ -42,10 +43,15 @@ if not _has_jax:
       "tabfm/src/jax/checkpointing_test.py",
       "tabfm/src/jax/memory_efficient_attention_test.py",
   ]
+if not _has_mlx:
+  collect_ignore.append("tabfm/src/classifier_and_regressor_mlx_test.py")
 # pytorch/model_test.py is a torch<->jax parity test: it imports both flax and
 # torch, so it needs *both* backends installed.
 if not (_has_torch and _has_jax):
   collect_ignore.append("tabfm/src/pytorch/model_test.py")
+# mlx/model_test.py is a torch<->mlx parity test: it needs both backends.
+if not (_has_torch and _has_mlx):
+  collect_ignore.append("tabfm/src/mlx/model_test.py")
 
 
 def pytest_configure(config):  # noqa: D401  (pytest hook)

@@ -52,6 +52,13 @@ try:
   HAS_TORCH = True
 except ImportError:
   HAS_TORCH = False
+
+try:
+  import mlx.core as mx
+  import mlx.nn as mlx_nn
+  HAS_MLX = True
+except ImportError:
+  HAS_MLX = False
 import pandas as pd
 import scipy.optimize as opt
 import scipy.special
@@ -1816,6 +1823,44 @@ def _predict_step_pytorch(
   return out_t.float().cpu().numpy()  # upcast: numpy has no bfloat16
 
 
+def _predict_step_mlx(
+    model: Any,
+    X_batch: np.ndarray,
+    y_batch: np.ndarray,
+    train_size_val: int,
+    ds_batch_val: Optional[np.ndarray],
+    cat_mask_batch: Optional[np.ndarray],
+) -> np.ndarray:
+  """Runs MLX forward pass and returns numpy array."""
+  if not HAS_MLX:
+    raise ImportError("MLX is required to run an MLX model.")
+
+  # MLX arrays live in unified memory; no device transfer is needed.
+  X_m = mx.array(X_batch.astype(np.float32, copy=False))
+  y_m = mx.array(
+      y_batch.astype(np.float32, copy=False)
+      if y_batch.dtype == np.float64
+      else y_batch
+  )
+
+  batch_size = X_batch.shape[0]
+  train_size_m = mx.full((batch_size,), train_size_val, dtype=mx.int32)
+
+  if ds_batch_val is not None:
+    d_m = mx.array(ds_batch_val.astype(np.int32, copy=False))
+  else:
+    d_m = mx.full((batch_size,), X_batch.shape[-1], dtype=mx.int32)
+
+  cat_mask_m = mx.array(cat_mask_batch) if cat_mask_batch is not None else None
+
+  # MLX is lazy and builds no autograd graph unless gradients are requested;
+  # mx.eval materializes the result before the numpy conversion.
+  out_m = model(X_m, y_m, train_size_m, cat_mask=cat_mask_m, d=d_m)
+  out_m = out_m.astype(mx.float32)  # upcast: numpy has no bfloat16
+  mx.eval(out_m)
+  return np.array(out_m)
+
+
 # ---------------------------------------------------------------------------
 # Classifier
 # ---------------------------------------------------------------------------
@@ -2181,9 +2226,11 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         where test_size = n_samples - train_size.
     """
     is_torch = HAS_TORCH and isinstance(self.model, torch.nn.Module)
+    is_mlx = HAS_MLX and isinstance(self.model, mlx_nn.Module)
 
-    if is_torch:
-      # --- PyTorch execution path ---
+    if is_torch or is_mlx:
+      # --- Eager (PyTorch / MLX) execution path ---
+      predict_step = _predict_step_pytorch if is_torch else _predict_step_mlx
       batch_size_per_process = self.batch_size or Xs.shape[0]
       n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
       if n_batches > 1:
@@ -2220,7 +2267,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
               constant_values=-100.0,
           )
 
-        out = _predict_step_pytorch(
+        out = predict_step(
             self.model,
             X_batch,
             y_batch,
@@ -2958,9 +3005,11 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       Model outputs of shape (n_datasets, n_test, output_dim).
     """
     is_torch = HAS_TORCH and isinstance(self.model, torch.nn.Module)
+    is_mlx = HAS_MLX and isinstance(self.model, mlx_nn.Module)
 
-    if is_torch:
-      # --- PyTorch execution path ---
+    if is_torch or is_mlx:
+      # --- Eager (PyTorch / MLX) execution path ---
+      predict_step = _predict_step_pytorch if is_torch else _predict_step_mlx
       batch_size_per_process = getattr(self, "batch_size", 1) or Xs.shape[0]
       n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
       if n_batches > 1:
@@ -2997,7 +3046,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
               constant_values=-100.0,
           )
 
-        out = _predict_step_pytorch(
+        out = predict_step(
             self.model,
             X_batch,
             y_batch,
