@@ -27,6 +27,9 @@ To release a new version (e.g. from `1.0.0` -> `2.0.0`):
   Apple-silicon inference. It reuses the PyTorch v1.0.0 weight release
   (identical parameter names/layouts) and is parity-tested against the PyTorch
   port to < 1e-4 max abs diff in float32.
+* Fixed the `pytorch` extra missing `safetensors`: with a bare `torch`
+  install, `tabfm_v1_0_0_pytorch.load()` raised `NameError` inside
+  `PyTorchModelHubMixin` when loading the safetensors release.
 
 ## [1.0.0] - 2026-06-29
 
