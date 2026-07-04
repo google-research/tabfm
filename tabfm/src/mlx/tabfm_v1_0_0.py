@@ -144,6 +144,10 @@ def load(
 
     if dtype is not None:
       model.set_dtype(dtype)  # engage the bf16 compute design (see docstring)
+    # Materialize the (lazy) checkpoint read + dtype cast now, so load errors
+    # surface here rather than inside the first forward pass, and the cached
+    # model is safe to share across threads.
+    mx.eval(model.parameters())
     model.eval()
 
     if use_cache:

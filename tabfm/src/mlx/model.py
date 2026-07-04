@@ -233,7 +233,9 @@ class Encoder(nn.Module):
     super().__init__()
     # One RoPE per Encoder (mirrors JAX `tf_row.rope.freqs`), shared by all
     # blocks.
-    self.rope = RoPE(d_model // nhead, rope_base) if rope_base is not None else None
+    self.rope = (
+        RoPE(d_model // nhead, rope_base) if rope_base is not None else None
+    )
     self.blocks = [
         MultiheadAttentionBlock(d_model, nhead, dim_ff, activation, rope_base)
         for _ in range(num_blocks)
@@ -290,18 +292,13 @@ class OneHotAndLinear(nn.Module):
 
   def __call__(self, y):  # y: [B, T] int
     y_int = y.astype(mx.int32)
-    y_mapped = mx.where(
-        mx.logical_and(y_int >= 0, y_int < self.num_classes),
-        y_int,
-        mx.array(self.num_classes, dtype=mx.int32),
-    )
-    # No mx.one_hot; compare against the class range instead. The extra
-    # "unknown" class column is sliced off, so out-of-range labels (e.g. the
-    # -100 padding sentinel) contribute only the projection bias.
-    oh = (y_mapped[..., None] == mx.arange(self.num_classes + 1)).astype(
+    # No mx.one_hot; compare against the class range instead. Out-of-range
+    # labels (e.g. the -100 padding sentinel) match no column and contribute
+    # only the projection bias -- identical to the PyTorch remap-then-slice.
+    oh = (y_int[..., None] == mx.arange(self.num_classes)).astype(
         self.projection.weight.dtype
     )
-    return self.projection(oh[..., : self.num_classes])
+    return self.projection(oh)
 
 
 class CellEmbedder(nn.Module):

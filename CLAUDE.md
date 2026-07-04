@@ -17,6 +17,7 @@ tabfm/__init__.py                      # Public API; guarded backend imports
 tabfm/src/classifier_and_regressor.py  # sklearn wrappers + preprocessing + backend dispatch
 tabfm/src/jax/                         # Reference backend (model.py, tabfm_v1_0_0.py, ...)
 tabfm/src/pytorch/                     # PyTorch port (model.py, tabfm_v1_0_0.py)
+tabfm/src/mlx/                         # MLX port (model.py, tabfm_v1_0_0.py)
 tabfm/src/hugging_face/                # Weight conversion / upload utilities
 examples/                              # Runnable end-to-end examples
 conftest.py                            # Skips backend tests when the backend is not installed
@@ -97,7 +98,7 @@ float32 (see the parity tests in `tabfm/src/pytorch/model_test.py`).
   run `fit`/`predict`/`predict_proba` on tiny random data with a small
   random-init model.
 - Run: `pytest -vv -n auto` from the repo root (CI uses Python 3.11 with
-  `pip install -e .[dev,jax,pytorch]`).
+  `pip install -e .[dev,jax,pytorch,mlx]`).
 - Tests must not require network access or pre-trained weights.
 
 ## Releases / docs

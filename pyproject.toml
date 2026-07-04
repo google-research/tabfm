@@ -61,9 +61,10 @@ pytorch = [
     "torch",
 ]
 # MLX backend. Runs on Apple silicon's unified memory (Metal); recent MLX
-# releases also ship CPU/CUDA wheels for Linux.
+# releases also ship CPU/CUDA wheels for Linux. The floor matches the APIs
+# the port relies on (boolean SDPA masks, nan_to_num, Module.set_dtype).
 mlx = [
-    "mlx",
+    "mlx>=0.31",
 ]
 
 # Development deps (unittest, linting, formating,...)
