@@ -34,6 +34,14 @@ pip install -e .[pytorch]
 ```
 *Note: For PyTorch with GPU support, ensure you have the appropriate PyTorch version installed for your CUDA version before installing TabFM.*
 
+**MLX (Apple silicon):**
+```bash
+git clone https://github.com/google-research/tabfm.git
+cd tabfm
+pip install -e .[mlx]
+```
+*Note: The MLX backend runs natively on Apple silicon (Metal / unified memory) and loads the PyTorch v1.0.0 weight release directly — no separate checkpoint is needed.*
+
 ### Requirements
 For a complete list of pinned dependencies and versions, please see [requirements.txt](requirements.txt). The core requirements depend on the backend you choose:
 *   Python >= 3.11
@@ -43,12 +51,14 @@ For a complete list of pinned dependencies and versions, please see [requirement
     *   Flax (specifically `flax==0.12.7`, using the modern `flax.nnx` API)
 *   **PyTorch Backend:**
     *   PyTorch (specifically `torch==2.12.1+cpu` or a GPU version)
+*   **MLX Backend:**
+    *   MLX (`mlx>=0.31`; Apple silicon recommended)
 
 ---
 
 ## Quick Start (TabFM v1.0.0)
 
-We provide pre-trained weights for the **TabFM v1.0.0** release. The library handles downloading and loading these weights automatically. You can choose to load the model using either the JAX or PyTorch backend.
+We provide pre-trained weights for the **TabFM v1.0.0** release. The library handles downloading and loading these weights automatically. You can choose to load the model using the JAX, PyTorch, or MLX backend.
 
 ### 1. Classification Example
 
@@ -67,7 +77,11 @@ model = tabfm_v1_0_0.load()
 # from tabfm import tabfm_v1_0_0_pytorch as tabfm_v1_0_0
 # model = tabfm_v1_0_0.load()
 
-# Initialize scikit-learn compatible classifier (works with either backend model)
+# OPTION C: MLX Backend (Apple silicon)
+# from tabfm import tabfm_v1_0_0_mlx as tabfm_v1_0_0
+# model = tabfm_v1_0_0.load()
+
+# Initialize scikit-learn compatible classifier (works with any backend model)
 clf = TabFMClassifier(model=model)
 
 # Prepare your dataset (supports mixed numerical and categorical features)
@@ -112,7 +126,11 @@ model = tabfm_v1_0_0.load(model_type="regression")
 # from tabfm import tabfm_v1_0_0_pytorch as tabfm_v1_0_0
 # model = tabfm_v1_0_0.load(model_type="regression")
 
-# Initialize scikit-learn compatible regressor (works with either backend model)
+# OPTION C: MLX Backend (Apple silicon)
+# from tabfm import tabfm_v1_0_0_mlx as tabfm_v1_0_0
+# model = tabfm_v1_0_0.load(model_type="regression")
+
+# Initialize scikit-learn compatible regressor (works with any backend model)
 reg = TabFMRegressor(model=model)
 
 # Prepare your dataset
@@ -132,6 +150,28 @@ reg.fit(X_train, y_train)
 predictions = reg.predict(X_test)
 
 print("Predicted Prices:", predictions)
+```
+
+### 3. LoRA Fine-Tuning (MLX backend, experimental)
+
+The MLX backend supports parameter-efficient fine-tuning: the pre-trained
+weights stay frozen and only low-rank adapters are trained.
+
+```python
+from tabfm import TabFMClassifier, tabfm_v1_0_0_mlx
+from tabfm.src.mlx import lora
+
+model = tabfm_v1_0_0_mlx.load()
+lora.apply_lora(model, rank=8)      # freeze base, add adapters (ICL blocks)
+
+clf = TabFMClassifier(model=model)
+# Fits the usual encoders/ensembles, then trains ONLY the adapters on the
+# same preprocessed matrix the wrapper feeds the model at predict time.
+lora.fit_lora(clf, X_train, y_train, steps=200)
+
+predictions = clf.predict(X_test)   # inference with the adapted model
+
+lora.merge_lora(model)              # optional: fold adapters into the base
 ```
 
 ---
@@ -167,6 +207,10 @@ PYTHONPATH=. python3 -m unittest discover -s tabfm/src/ -p "*_test.py"
 # Or run specific test files:
 PYTHONPATH=. python3 -m unittest tabfm/src/pytorch/model_test.py
 PYTHONPATH=. python3 -m unittest tabfm/src/classifier_and_regressor_pytorch_test.py
+
+# MLX backend tests (require mlx; the parity test also requires torch):
+PYTHONPATH=. python3 -m unittest tabfm/src/mlx/model_test.py
+PYTHONPATH=. python3 -m unittest tabfm/src/classifier_and_regressor_mlx_test.py
 ```
 
 Alternatively, if you have Bazel installed, you can run tests with:
