@@ -44,7 +44,10 @@ if not _has_jax:
       "tabfm/src/jax/memory_efficient_attention_test.py",
   ]
 if not _has_mlx:
-  collect_ignore.append("tabfm/src/classifier_and_regressor_mlx_test.py")
+  collect_ignore += [
+      "tabfm/src/classifier_and_regressor_mlx_test.py",
+      "tabfm/src/mlx/lora_test.py",
+  ]
 # pytorch/model_test.py is a torch<->jax parity test: it imports both flax and
 # torch, so it needs *both* backends installed.
 if not (_has_torch and _has_jax):

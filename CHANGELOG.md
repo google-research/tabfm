@@ -23,6 +23,12 @@ To release a new version (e.g. from `1.0.0` -> `2.0.0`):
 
 ## [Unreleased]
 
+* Added LoRA fine-tuning utilities for the MLX backend
+  (`tabfm/src/mlx/lora.py`): `apply_lora` / `train_lora` / `fit_lora` /
+  `merge_lora` / adapter save-load. Only the low-rank adapters are trained;
+  the pre-trained base weights stay frozen. `fit_lora` reuses the sklearn
+  wrapper's `fit` preprocessing so adapters train on the exact numeric
+  distribution the model sees at predict time.
 * Added an MLX backend (`tabfm/src/mlx/`, `pip install -e .[mlx]`) for native
   Apple-silicon inference. It reuses the PyTorch v1.0.0 weight release
   (identical parameter names/layouts) and is parity-tested against the PyTorch

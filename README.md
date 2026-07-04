@@ -152,6 +152,28 @@ predictions = reg.predict(X_test)
 print("Predicted Prices:", predictions)
 ```
 
+### 3. LoRA Fine-Tuning (MLX backend, experimental)
+
+The MLX backend supports parameter-efficient fine-tuning: the pre-trained
+weights stay frozen and only low-rank adapters are trained.
+
+```python
+from tabfm import TabFMClassifier, tabfm_v1_0_0_mlx
+from tabfm.src.mlx import lora
+
+model = tabfm_v1_0_0_mlx.load()
+lora.apply_lora(model, rank=8)      # freeze base, add adapters (ICL blocks)
+
+clf = TabFMClassifier(model=model)
+# Fits the usual encoders/ensembles, then trains ONLY the adapters on the
+# same preprocessed matrix the wrapper feeds the model at predict time.
+lora.fit_lora(clf, X_train, y_train, steps=200)
+
+predictions = clf.predict(X_test)   # inference with the adapted model
+
+lora.merge_lora(model)              # optional: fold adapters into the base
+```
+
 ---
 
 ## Examples Directory
