@@ -151,6 +151,8 @@ rich==13.7.1
     # via
     #   flax
     #   typer
+safetensors==0.8.0
+    # via tabfm (pyproject.toml)
 scikit-learn==1.6.0
     # via tabfm (pyproject.toml)
 scipy==1.17.1

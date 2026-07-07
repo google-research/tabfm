@@ -54,7 +54,17 @@ jax = [
     "orbax-checkpoint",
 ]
 pytorch = [
+    # safetensors is required by PyTorchModelHubMixin to load the v1.0.0
+    # weight release; huggingface-hub does not depend on it itself, so a
+    # bare `torch` install fails at load() with a NameError.
+    "safetensors",
     "torch",
+]
+# MLX backend. Runs on Apple silicon's unified memory (Metal); recent MLX
+# releases also ship CPU/CUDA wheels for Linux. The floor matches the APIs
+# the port relies on (boolean SDPA masks, nan_to_num, Module.set_dtype).
+mlx = [
+    "mlx>=0.31",
 ]
 
 # Development deps (unittest, linting, formating,...)

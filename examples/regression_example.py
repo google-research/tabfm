@@ -28,6 +28,9 @@ def run_example(model=None) -> np.ndarray:
     # Option B: PyTorch Backend
     # model = tabfm.tabfm_v1_0_0_pytorch.load(model_type="regression")
 
+    # Option C: MLX Backend (Apple silicon)
+    # model = tabfm.tabfm_v1_0_0_mlx.load(model_type="regression")
+
   # 2. Initialize scikit-learn compatible regressor
   reg = tabfm.TabFMRegressor(model=model)
 

@@ -90,6 +90,9 @@ def run_example(model=None):
     # Option B: PyTorch Backend
     # model = tabfm.tabfm_v1_0_0_pytorch.load(model_type="regression")
 
+    # Option C: MLX Backend (Apple silicon)
+    # model = tabfm.tabfm_v1_0_0_mlx.load(model_type="regression")
+
   x_train, y_train, x_test, y_test = _load_fold_0(TASK_ID)
 
   results = {}
