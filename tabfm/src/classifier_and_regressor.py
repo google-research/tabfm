@@ -1534,11 +1534,31 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
         X_test=None, train_fold=train_fold, val_fold=val_fold
     )
 
+  def context_tensors(
+      self,
+  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Any]]:
+    """Build the fitted in-context tensors (all train rows, no query block).
+
+    Produces the same per-member tensors as ``prepare_ensemble_tensors``, but
+    for the training context alone: no test/query rows are appended, so unlike
+    ``transform`` no query row (real or dummy) is required. This is the context
+    that ``fit_mode="fit_with_cache"`` feeds to ``model.prefill``.
+
+    Returns:
+      The ``prepare_ensemble_tensors`` 5-tuple
+      ``(Xs, ys, cat_masks, ds, configs_flat)`` with only context rows in
+      ``Xs`` (so ``Xs.shape[1] == ys.shape[1]``).
+    """
+    check_is_fitted(self, ["ensemble_configs_"])
+    data, _ = self._transform_features(X_test=None, context_only=True)
+    return self.prepare_ensemble_tensors(data)
+
   def _transform_features(
       self,
       X_test: Optional[np.ndarray],
       train_fold: Optional[np.ndarray] = None,
       val_fold: Optional[np.ndarray] = None,
+      context_only: bool = False,
   ) -> Tuple[collections.OrderedDict, List[np.ndarray]]:
     """Shared helper to construct transformed feature and target dictionaries.
 
@@ -1554,6 +1574,9 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
         during cross-validation. If None, all active training rows are used.
       val_fold: Optional array of indices selecting evaluation validation rows
         during cross-validation.
+      context_only: If True, build only the training-context tensors (no query
+        block); ``X_test`` / ``val_fold`` are ignored. Used by
+        ``context_tensors``.
 
     Returns:
       A tuple containing:
@@ -1609,22 +1632,28 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
           # Note: self.X_ is the fitted training data. X_test is the test data.
           # We need to construct the full dataset (Train + Test)
           X_train_to_use = self.X_[train_idx]
-          X_test_to_use = self.X_[val_idx] if val_idx is not None else X_test
-          X_full = np.concatenate([X_train_to_use, X_test_to_use], axis=0)
+          if context_only:
+            X_full = X_train_to_use
+          else:
+            X_test_to_use = self.X_[val_idx] if val_idx is not None else X_test
+            X_full = np.concatenate([X_train_to_use, X_test_to_use], axis=0)
 
           # Apply value permutation
           _apply_categorical_permutation(X_full, cat_perm)
           X_variant_instance = preprocessor.transform(X_full)
         else:
           X_train_trans = preprocessor.X_transformed_[train_idx]
-          X_test_trans = (
-              preprocessor.X_transformed_[val_idx]
-              if val_idx is not None
-              else preprocessor.transform(X_test)
-          )
-          X_variant_instance = np.concatenate(
-              [X_train_trans, X_test_trans], axis=0
-          )
+          if context_only:
+            X_variant_instance = X_train_trans
+          else:
+            X_test_trans = (
+                preprocessor.X_transformed_[val_idx]
+                if val_idx is not None
+                else preprocessor.transform(X_test)
+            )
+            X_variant_instance = np.concatenate(
+                [X_train_trans, X_test_trans], axis=0
+            )
 
         # Apply feature shuffling
         shuffled_cols = X_variant_instance[:, shuffle_pattern]
@@ -1826,12 +1855,55 @@ def _predict_step_pytorch(
   return out_t.float().cpu().numpy()  # upcast: numpy has no bfloat16
 
 
-# Compiled predict step functions memoized on the estimators by
-# _batch_forward. They close over nnx.jit state and cannot be pickled.
+# Compiled predict step functions memoized on the estimators by _batch_forward.
+# They close over nnx.jit state and cannot be pickled. (The cached decode path
+# runs model.decode eagerly, so it memoizes nothing here.)
 _COMPILED_PREDICT_CACHE_ATTRS = (
     "_predict_step_compiled_with_cat",
     "_predict_step_compiled_no_cat",
 )
+
+# Accepted values for the ``fit_mode`` constructor argument (TabPFN parity).
+_VALID_FIT_MODES = ("fit", "fit_with_cache")
+
+
+def _active_data_shards() -> int:
+  """Return the size of the active mesh's ``"data"`` axis (1 if none)."""
+  if not HAS_JAX:
+    return 1
+  mesh = jax.sharding.get_mesh()
+  if mesh and "data" in mesh.axis_names:
+    return mesh.axis_sizes[mesh.axis_names.index("data")]
+  return 1
+
+
+def _check_fit_with_cache_supported(model: Any) -> None:
+  """Validate that ``fit_mode="fit_with_cache"`` can run for ``model``.
+
+  Args:
+    model: The wrapped foundation model.
+
+  Raises:
+    NotImplementedError: If the model does not expose the JAX prefill/decode
+      API, or if a data-parallel mesh (a ``"data"`` axis of size > 1) is active.
+      Unlike the default ``_batch_forward`` path, the cached prefill/decode path
+      is not sharded and runs on a single device.
+  """
+  if not hasattr(model, "prefill"):
+    raise NotImplementedError(
+        'fit_mode="fit_with_cache" requires a JAX TabFM model exposing'
+        " prefill/decode; the provided model does not."
+    )
+  num_data_shards = _active_data_shards()
+  if num_data_shards > 1:
+    raise NotImplementedError(
+        'fit_mode="fit_with_cache" does not support data-parallel sharding'
+        f' (found a "data" mesh axis of size {num_data_shards}); the cached'
+        " prefill/decode path runs on a single device. Use the default"
+        ' fit_mode="fit" under a data-parallel mesh.'
+    )
+
+
 def _check_classifier_output_dim(output_dim: int, n_classes: int) -> None:
   """Validates that the model produces logits for all target classes.
 
@@ -1939,6 +2011,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       nnls_beta: float = 0.75,
       calibration_lambda: float = 1e-2,
       min_rows_for_single_val_split: int = 2000,
+      fit_mode: str = "fit",
   ):
     """Initialises the classifier.
 
@@ -1982,6 +2055,16 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       min_rows_for_single_val_split: Minimum validation rows required to allow
         learning ensemble/calibration weights on a single train/val split
         instead of full CV. 0 means always doing full CV.
+      fit_mode: Either ``"fit"`` (default) or ``"fit_with_cache"``. With
+        ``"fit_with_cache"`` the training-context KV cache is precomputed at fit
+        time via ``model.prefill`` so that ``predict`` reuses it through
+        ``model.decode`` instead of re-encoding the context on every call. This
+        trades extra accelerator memory (proportional to context length times
+        ``n_estimators``) for cheaper predictions and requires a JAX model.
+        Unlike the default path, the cached path is not data-parallel sharded
+        and runs on a single device: fitting with it raises
+        ``NotImplementedError`` if a mesh with a ``"data"`` axis of size > 1 is
+        active.
     """
     self.model = model
     self.n_estimators = n_estimators
@@ -2009,6 +2092,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     self.nnls_beta = nnls_beta
     self.calibration_lambda = calibration_lambda
     self.min_rows_for_single_val_split = min_rows_for_single_val_split
+    self.fit_mode = fit_mode
     if self.average_logits and self.enable_nnls:
       raise ValueError("average_logits and enable_nnls cannot both be True.")
     if self.max_num_rows is not None and self.enable_nnls:
@@ -2074,8 +2158,16 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
 
     Raises:
       ValueError
-        If the number of classes exceeds the model's maximum supported classes.
+        If the number of classes exceeds the model's maximum supported classes,
+        or if ``fit_mode`` is not one of ``"fit"`` / ``"fit_with_cache"``.
     """
+    if self.fit_mode not in _VALID_FIT_MODES:
+      raise ValueError(
+          f"fit_mode must be one of {_VALID_FIT_MODES}, got {self.fit_mode!r}."
+      )
+    # Fail fast, before any fitting work, if the cached path is unsupported.
+    if self.fit_mode == "fit_with_cache":
+      _check_fit_with_cache_supported(self.model)
     check_classification_targets(y)
 
     # Encode class labels
@@ -2191,6 +2283,9 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       )
       self._fit_calibration(P, y_fit)
 
+    if self.fit_mode == "fit_with_cache":
+      self._build_context_cache()
+
     return self
 
   @jt.typed
@@ -2297,11 +2392,10 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         raise ImportError("JAX is required to run a JAX model.")
       # --- JAX execution path ---
       mesh = jax.sharding.get_mesh()
+      num_data_shards = _active_data_shards()
       if mesh and "data" in mesh.axis_names:
-        num_data_shards = mesh.axis_sizes[mesh.axis_names.index("data")]
         data_sharding = NamedSharding(mesh, PartitionSpec("data"))
       else:
-        num_data_shards = 1
         data_sharding = None
 
       num_classes = self.n_classes_
@@ -2465,15 +2559,18 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       return np.concatenate(outputs, axis=0)
 
   def __getstate__(self):
-    """Drops memoized compiled predict functions from the pickled state.
+    """Drops unpicklable prediction caches from the pickled state.
 
     The first predict memoizes nnx.jit-compiled step functions on the
-    estimator (see _batch_forward). Those closures cannot be pickled; they
-    are pure caches and are rebuilt lazily on the next predict.
+    estimator (see _batch_forward / _decode_batch_forward), and
+    fit_mode="fit_with_cache" stores the prefill KV cache in _context_cache_.
+    Neither can be pickled; both are pure caches, rebuilt lazily on the next
+    predict (the context cache via _ensure_context_cache).
     """
     state = dict(super().__getstate__())
     for attr in _COMPILED_PREDICT_CACHE_ATTRS:
       state.pop(attr, None)
+    state.pop("_context_cache_", None)
     return state
 
   @jt.typed
@@ -2658,6 +2755,154 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
 
     return P
 
+  def _context_only_tensors(
+      self,
+  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return the fitted context-only ensemble tensors (no query rows).
+
+    Delegates to ``EnsembleGenerator.context_tensors``, which builds the
+    per-member in-context tensors from the generator's fitted state without a
+    query block (so no dummy query row is transformed).
+
+    Returns:
+      Tuple ``(Xs_ctx, ys_ctx, cat_masks, ds)`` where ``Xs_ctx`` has shape
+      ``(n_members, context_len, n_features)``, ``ys_ctx`` has shape
+      ``(n_members, context_len)``, ``cat_masks`` has shape
+      ``(n_members, n_features)`` and ``ds`` has shape ``(n_members,)``.
+    """
+    Xs, ys, cat_masks, ds, _ = self.ensemble_generator_.context_tensors()
+    return Xs, ys, cat_masks, ds
+
+  def _build_context_cache(self) -> None:
+    """Precompute the per-chunk training-context KV caches via ``model.prefill``.
+
+    Runs ``model.prefill`` once per ensemble-member chunk (chunked by
+    ``self.batch_size``, mirroring ``_batch_forward``) and stores the resulting
+    caches for reuse by ``_decode_batch_forward``. Members are chunked here so
+    ``_decode_batch_forward`` can pair each query chunk with the cache built
+    from the same members' context; column caches are flattened over the
+    member*feature axis internally, so per-chunk storage avoids slicing them by
+    member. Called from ``fit`` when ``fit_mode == "fit_with_cache"``.
+    """
+    # Also guards the lazy rebuild path (_ensure_context_cache after unpickle),
+    # where the active mesh may differ from fit time.
+    _check_fit_with_cache_supported(self.model)
+    Xs_ctx, ys_ctx, cat_masks, ds = self._context_only_tensors()
+    self._cache_ctx_len_ = int(ys_ctx.shape[1])
+
+    has_cat = cat_masks is not None and hasattr(self.model, "cell_embedder")
+    batch_size_per_process = self.batch_size or Xs_ctx.shape[0]
+    n_batches = math.ceil(Xs_ctx.shape[0] / batch_size_per_process)
+    Xs_split = np.array_split(Xs_ctx, n_batches)
+    ys_split = np.array_split(ys_ctx, n_batches)
+    cat_masks_split = (
+        np.array_split(cat_masks, n_batches) if has_cat else [None] * n_batches
+    )
+    ds_split = (
+        np.array_split(ds, n_batches) if ds is not None else [None] * n_batches
+    )
+
+    caches = []
+    for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
+        Xs_split, ys_split, cat_masks_split, ds_split
+    ):
+      X_batch = jnp.asarray(X_batch, dtype=jnp.float32)
+      y_batch = jnp.asarray(y_batch, dtype=jnp.float32)
+      if ds_batch_val is not None:
+        d_batch = jnp.asarray(ds_batch_val, dtype=jnp.int32)
+      else:
+        d_batch = jnp.full((X_batch.shape[0],), X_batch.shape[-1], jnp.int32)
+      # prefill is run once at fit time, so it is left uncompiled.
+      if cat_mask_batch is not None:
+        cat_mask_batch = jnp.asarray(cat_mask_batch, dtype=jnp.bool_)
+        _, cache = self.model.prefill(
+            X_batch, y_batch, d=d_batch, cat_mask=cat_mask_batch
+        )
+      else:
+        _, cache = self.model.prefill(X_batch, y_batch, d=d_batch)
+      caches.append(cache)
+
+    self._context_cache_ = caches
+
+  def _ensure_context_cache(self) -> None:
+    """Rebuild the context cache if missing (e.g. after unpickling)."""
+    if not hasattr(self, "_context_cache_"):
+      self._build_context_cache()
+
+  @jt.typed
+  def _decode_batch_forward(
+      self,
+      Xs: jt.Float[Array | np.ndarray, "B T_test H"],
+      cat_masks: Optional[jt.Bool[Array | np.ndarray, "B H"]] = None,
+      ds: Optional[jt.Int[Array | np.ndarray, "B"]] = None,
+  ) -> jt.Float[Array | np.ndarray, "B T_test K"]:
+    """Decode query rows against the precomputed context caches.
+
+    Reuses the per-chunk caches in ``self._context_cache_`` (built by
+    ``_build_context_cache``), chunking members by ``self.batch_size`` exactly
+    as ``_batch_forward`` does. ``model.decode`` is called eagerly (no
+    ``nnx.jit``): passing the multi-gigabyte context caches as jit arguments
+    makes XLA copy them into the executable's arena (roughly doubling peak
+    memory) and fuse a large transpose that OOMs or fails autotuning at real
+    context lengths. Eager decode also matches the supported usage exercised by
+    the model-level tests (``model_test.py``). ``model.decode`` pads the query
+    sequence to a multiple of 128 and unpads it internally, so only the query
+    rows are passed here.
+
+    Args:
+      Xs: Query features of shape (n_members, n_test, n_features).
+      cat_masks: Optional categorical mask of shape (n_members, n_features).
+      ds: Optional active-feature counts of shape (n_members,).
+
+    Returns:
+      Model outputs of shape (n_members, n_test, n_classes_bins).
+    """
+    if not HAS_JAX:
+      raise ImportError("JAX is required to run a JAX model.")
+
+    caches = self._context_cache_
+    has_cat = cat_masks is not None and hasattr(self.model, "cell_embedder")
+    batch_size_per_process = self.batch_size or Xs.shape[0]
+    n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
+    if len(caches) != n_batches:
+      raise RuntimeError(
+          f"Expected {n_batches} cached context chunks but got {len(caches)};"
+          " the context cache is stale. Refit the estimator so the cache is"
+          " rebuilt for the current batch_size (do not mutate batch_size after"
+          " fit_mode='fit_with_cache')."
+      )
+    Xs_split = np.array_split(Xs, n_batches)
+    cat_masks_split = (
+        np.array_split(cat_masks, n_batches) if has_cat else [None] * n_batches
+    )
+    ds_split = (
+        np.array_split(ds, n_batches) if ds is not None else [None] * n_batches
+    )
+
+    outputs = []
+    for X_batch, cache_batch, cat_mask_batch, ds_batch_val in zip(
+        Xs_split, caches, cat_masks_split, ds_split
+    ):
+      X_batch = jnp.asarray(X_batch, dtype=jnp.float32)
+      if ds_batch_val is not None:
+        d_batch = jnp.asarray(ds_batch_val, dtype=jnp.int32)
+      else:
+        d_batch = jnp.full((X_batch.shape[0],), X_batch.shape[-1], jnp.int32)
+
+      # Decode eagerly, passing the prefill cache dict straight through;
+      # model.decode unpads the padded query sequence internally.
+      if cat_mask_batch is not None:
+        cat_mask_batch = jnp.asarray(cat_mask_batch, dtype=jnp.bool_)
+        out = self.model.decode(
+            X_batch, cache_batch, d=d_batch, cat_mask=cat_mask_batch
+        )
+      else:
+        out = self.model.decode(X_batch, cache_batch, d=d_batch)
+
+      outputs.append(np.asarray(out))
+
+    return np.concatenate(outputs, axis=0)
+
   @jt.typed
   def _predict_proba_internal(self, X: Any) -> jt.Float[Array | np.ndarray, "E T K"]:
     """Predict class probabilities for test samples."""
@@ -2677,7 +2922,19 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         _,
     ) = self.ensemble_generator_.prepare_ensemble_tensors(data)
 
-    outputs = self._batch_forward(Xs_all, ys_all, cat_masks_all, ds=ds_all)
+    if getattr(self, "fit_mode", "fit") == "fit_with_cache":
+      self._ensure_context_cache()
+      # Context rows lead each member view; ys length is the context length.
+      context_len = self._cache_ctx_len_
+      if ys_all.shape[1] != context_len:
+        raise RuntimeError(
+            "Context length changed since fit_mode='fit_with_cache' built the"
+            f" cache ({ys_all.shape[1]} vs {context_len}); refit the estimator."
+        )
+      queries = Xs_all[:, context_len:, :]
+      outputs = self._decode_batch_forward(queries, cat_masks_all, ds=ds_all)
+    else:
+      outputs = self._batch_forward(Xs_all, ys_all, cat_masks_all, ds=ds_all)
     _check_classifier_output_dim(outputs.shape[-1], self.n_classes_)
     outputs = outputs[..., :self.n_classes_]
 
@@ -2834,6 +3091,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       enable_nnls: bool = False,
       nnls_beta: float = 0.75,
       min_rows_for_single_val_split: int = 2000,
+      fit_mode: str = "fit",
   ):
     """Initialises the regressor.
 
@@ -2866,6 +3124,16 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       min_rows_for_single_val_split: Minimum validation rows required to allow
         learning ensemble weights on a single train/val split instead of full
         CV. 0 means always doing full CV.
+      fit_mode: Either ``"fit"`` (default) or ``"fit_with_cache"``. With
+        ``"fit_with_cache"`` the training-context KV cache is precomputed at fit
+        time via ``model.prefill`` so that ``predict`` reuses it through
+        ``model.decode`` instead of re-encoding the context on every call. This
+        trades extra accelerator memory (proportional to context length times
+        ``n_estimators``) for cheaper predictions and requires a JAX model.
+        Unlike the default path, the cached path is not data-parallel sharded
+        and runs on a single device: fitting with it raises
+        ``NotImplementedError`` if a mesh with a ``"data"`` axis of size > 1 is
+        active.
     """
     self.model = model
     self.n_estimators = n_estimators
@@ -2887,6 +3155,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     self.enable_nnls = enable_nnls
     self.nnls_beta = nnls_beta
     self.min_rows_for_single_val_split = min_rows_for_single_val_split
+    self.fit_mode = fit_mode
     if self.max_num_rows is not None and self.enable_nnls:
       raise ValueError(
           "max_num_rows and enable_nnls cannot both be set at this time."
@@ -2940,7 +3209,17 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     Returns:
       self : TabFMRegressor
           Fitted regressor instance.
+
+    Raises:
+      ValueError: If ``fit_mode`` is not one of ``"fit"`` / ``"fit_with_cache"``.
     """
+    if self.fit_mode not in _VALID_FIT_MODES:
+      raise ValueError(
+          f"fit_mode must be one of {_VALID_FIT_MODES}, got {self.fit_mode!r}."
+      )
+    # Fail fast, before any fitting work, if the cached path is unsupported.
+    if self.fit_mode == "fit_with_cache":
+      _check_fit_with_cache_supported(self.model)
     y_orig = np.array(y).copy()
     y = check_array(y, ensure_2d=False, dtype="numeric")
     self.X_encoder_ = TransformToNumerical(
@@ -3002,6 +3281,9 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       self.ensemble_weights_ = (
           self.nnls_beta * weights + (1.0 - self.nnls_beta) * avg_weights
       )
+
+    if self.fit_mode == "fit_with_cache":
+      self._build_context_cache()
 
     return self
 
@@ -3088,11 +3370,10 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
         raise ImportError("JAX is required to run a JAX model.")
       # --- JAX execution path ---
       mesh = jax.sharding.get_mesh()
+      num_data_shards = _active_data_shards()
       if mesh and "data" in mesh.axis_names:
-        num_data_shards = mesh.axis_sizes[mesh.axis_names.index("data")]
         data_sharding = NamedSharding(mesh, PartitionSpec("data"))
       else:
-        num_data_shards = 1
         data_sharding = None
 
       _has_compiled_attr = (
@@ -3250,15 +3531,18 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     return self.y_scaler_.inverse_transform(y_scaled.reshape(-1, 1)).flatten()
 
   def __getstate__(self):
-    """Drops memoized compiled predict functions from the pickled state.
+    """Drops unpicklable prediction caches from the pickled state.
 
     The first predict memoizes nnx.jit-compiled step functions on the
-    estimator (see _batch_forward). Those closures cannot be pickled; they
-    are pure caches and are rebuilt lazily on the next predict.
+    estimator (see _batch_forward / _decode_batch_forward), and
+    fit_mode="fit_with_cache" stores the prefill KV cache in _context_cache_.
+    Neither can be pickled; both are pure caches, rebuilt lazily on the next
+    predict (the context cache via _ensure_context_cache).
     """
     state = dict(super().__getstate__())
     for attr in _COMPILED_PREDICT_CACHE_ATTRS:
       state.pop(attr, None)
+    state.pop("_context_cache_", None)
     return state
 
   @jt.typed
@@ -3339,12 +3623,160 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
 
     return outputs_oof
 
+  def _context_only_tensors(
+      self,
+  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return the fitted context-only ensemble tensors (no query rows).
+
+    Delegates to ``EnsembleGenerator.context_tensors``, which builds the
+    per-member in-context tensors from the generator's fitted state without a
+    query block (so no dummy query row is transformed).
+
+    Returns:
+      Tuple ``(Xs_ctx, ys_ctx, cat_masks, ds)`` shaped as in the classifier's
+      counterpart.
+    """
+    Xs, ys, cat_masks, ds, _ = self.ensemble_generator_.context_tensors()
+    return Xs, ys, cat_masks, ds
+
+  def _build_context_cache(self) -> None:
+    """Precompute the per-chunk training-context KV caches via ``model.prefill``.
+
+    Runs ``model.prefill`` once per ensemble-member chunk (chunked by
+    ``self.batch_size``, mirroring ``_batch_forward``) and stores the resulting
+    caches for reuse by ``_decode_batch_forward``. Members are chunked here so
+    ``_decode_batch_forward`` can pair each query chunk with the cache built
+    from the same members' context; column caches are flattened over the
+    member*feature axis internally, so per-chunk storage avoids slicing them by
+    member. Called from ``fit`` when ``fit_mode == "fit_with_cache"``.
+    """
+    # Also guards the lazy rebuild path (_ensure_context_cache after unpickle),
+    # where the active mesh may differ from fit time.
+    _check_fit_with_cache_supported(self.model)
+    Xs_ctx, ys_ctx, cat_masks, ds = self._context_only_tensors()
+    self._cache_ctx_len_ = int(ys_ctx.shape[1])
+
+    has_cat = cat_masks is not None and hasattr(self.model, "cell_embedder")
+    batch_size_per_process = self.batch_size or Xs_ctx.shape[0]
+    n_batches = math.ceil(Xs_ctx.shape[0] / batch_size_per_process)
+    Xs_split = np.array_split(Xs_ctx, n_batches)
+    ys_split = np.array_split(ys_ctx, n_batches)
+    cat_masks_split = (
+        np.array_split(cat_masks, n_batches) if has_cat else [None] * n_batches
+    )
+    ds_split = (
+        np.array_split(ds, n_batches) if ds is not None else [None] * n_batches
+    )
+
+    caches = []
+    for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
+        Xs_split, ys_split, cat_masks_split, ds_split
+    ):
+      X_batch = jnp.asarray(X_batch, dtype=jnp.float32)
+      y_batch = jnp.asarray(y_batch, dtype=jnp.float32)
+      if ds_batch_val is not None:
+        d_batch = jnp.asarray(ds_batch_val, dtype=jnp.int32)
+      else:
+        d_batch = jnp.full((X_batch.shape[0],), X_batch.shape[-1], jnp.int32)
+      # prefill is run once at fit time, so it is left uncompiled.
+      if cat_mask_batch is not None:
+        cat_mask_batch = jnp.asarray(cat_mask_batch, dtype=jnp.bool_)
+        _, cache = self.model.prefill(
+            X_batch, y_batch, d=d_batch, cat_mask=cat_mask_batch
+        )
+      else:
+        _, cache = self.model.prefill(X_batch, y_batch, d=d_batch)
+      caches.append(cache)
+
+    self._context_cache_ = caches
+
+  def _ensure_context_cache(self) -> None:
+    """Rebuild the context cache if missing (e.g. after unpickling)."""
+    if not hasattr(self, "_context_cache_"):
+      self._build_context_cache()
+
+  @jt.typed
+  def _decode_batch_forward(
+      self,
+      Xs: jt.Float[Array | np.ndarray, "B T_test H"],
+      cat_masks: Optional[jt.Bool[Array | np.ndarray, "B H"]] = None,
+      ds: Optional[jt.Int[Array | np.ndarray, "B"]] = None,
+  ) -> jt.Float[Array | np.ndarray, "B T_test L_out"]:
+    """Decode query rows against the precomputed context caches.
+
+    Reuses the per-chunk caches in ``self._context_cache_`` (built by
+    ``_build_context_cache``), chunking members by ``self.batch_size`` exactly
+    as ``_batch_forward`` does. ``model.decode`` is called eagerly (no
+    ``nnx.jit``): passing the multi-gigabyte context caches as jit arguments
+    makes XLA copy them into the executable's arena (roughly doubling peak
+    memory) and fuse a large transpose that OOMs or fails autotuning at real
+    context lengths. Eager decode also matches the supported usage exercised by
+    the model-level tests (``model_test.py``). ``model.decode`` pads the query
+    sequence to a multiple of 128 and unpads it internally, so only the query
+    rows are passed here.
+
+    Args:
+      Xs: Query features of shape (n_members, n_test, n_features).
+      cat_masks: Optional categorical mask of shape (n_members, n_features).
+      ds: Optional active-feature counts of shape (n_members,).
+
+    Returns:
+      Model outputs of shape (n_members, n_test, output_dim).
+    """
+    if not HAS_JAX:
+      raise ImportError("JAX is required to run a JAX model.")
+
+    caches = self._context_cache_
+    has_cat = cat_masks is not None and hasattr(self.model, "cell_embedder")
+    batch_size_per_process = self.batch_size or Xs.shape[0]
+    n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
+    if len(caches) != n_batches:
+      raise RuntimeError(
+          f"Expected {n_batches} cached context chunks but got {len(caches)};"
+          " the context cache is stale. Refit the estimator so the cache is"
+          " rebuilt for the current batch_size (do not mutate batch_size after"
+          " fit_mode='fit_with_cache')."
+      )
+    Xs_split = np.array_split(Xs, n_batches)
+    cat_masks_split = (
+        np.array_split(cat_masks, n_batches) if has_cat else [None] * n_batches
+    )
+    ds_split = (
+        np.array_split(ds, n_batches) if ds is not None else [None] * n_batches
+    )
+
+    outputs = []
+    for X_batch, cache_batch, cat_mask_batch, ds_batch_val in zip(
+        Xs_split, caches, cat_masks_split, ds_split
+    ):
+      X_batch = jnp.asarray(X_batch, dtype=jnp.float32)
+      if ds_batch_val is not None:
+        d_batch = jnp.asarray(ds_batch_val, dtype=jnp.int32)
+      else:
+        d_batch = jnp.full((X_batch.shape[0],), X_batch.shape[-1], jnp.int32)
+
+      # Decode eagerly, passing the prefill cache dict straight through;
+      # model.decode unpads the padded query sequence internally.
+      if cat_mask_batch is not None:
+        cat_mask_batch = jnp.asarray(cat_mask_batch, dtype=jnp.bool_)
+        out = self.model.decode(
+            X_batch, cache_batch, d=d_batch, cat_mask=cat_mask_batch
+        )
+      else:
+        out = self.model.decode(X_batch, cache_batch, d=d_batch)
+
+      outputs.append(np.asarray(out))
+
+    return np.concatenate(outputs, axis=0)
+
   @jt.typed
   def _predict_internal(self, X: Any) -> jt.Float[Array | np.ndarray, "E T"]:
     """Predict regression target for test samples."""
     check_is_fitted(self)
     if isinstance(X, np.ndarray) and len(X.shape) == 1:
-      raise ValueError("The provided input X is one-dimensional. Reshape your data.")
+      raise ValueError(
+          "The provided input X is one-dimensional. Reshape your data."
+      )
 
     X_transformed = self.X_encoder_.transform(X)
     data = self.ensemble_generator_.transform(X_transformed)
@@ -3356,7 +3788,19 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
         _,
     ) = self.ensemble_generator_.prepare_ensemble_tensors(data)
 
-    output = self._batch_forward(Xs_all, ys_all, cat_masks_all, ds=ds_all)
+    if getattr(self, "fit_mode", "fit") == "fit_with_cache":
+      self._ensure_context_cache()
+      # Context rows lead each member view; ys length is the context length.
+      context_len = self._cache_ctx_len_
+      if ys_all.shape[1] != context_len:
+        raise RuntimeError(
+            "Context length changed since fit_mode='fit_with_cache' built the"
+            f" cache ({ys_all.shape[1]} vs {context_len}); refit the estimator."
+        )
+      queries = Xs_all[:, context_len:, :]
+      output = self._decode_batch_forward(queries, cat_masks_all, ds=ds_all)
+    else:
+      output = self._batch_forward(Xs_all, ys_all, cat_masks_all, ds=ds_all)
     _check_regressor_output_dim(output.shape[-1])
     predictions = output.squeeze(-1)
     return predictions

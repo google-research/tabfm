@@ -21,6 +21,7 @@ import pandas as pd
 from sklearn.exceptions import NotFittedError
 
 try:
+  import jax.numpy as jnp
   from flax import nnx
   from tabfm.src.jax import model as tabfm_model
   HAS_JAX = True
@@ -89,6 +90,45 @@ class EnsembleGeneratorTest(absltest.TestCase):
     self.assertLess(
         identity_count, n_estimators, "Categorical permutations should vary."
     )
+
+  def test_context_tensors_matches_dummy_query_derivation(self):
+    # context_tensors() must reproduce exactly what the old dummy-query-row
+    # derivation produced: transform a single dummy query row through the
+    # public path, then slice it off (ys length is the context length). This
+    # pins the equivalence the removed dummy-row hack relied on, under both
+    # categorical permutation and row subsampling.
+    rng = np.random.RandomState(0)
+    X = pd.DataFrame({
+        "cat": rng.choice(["a", "b", "c"], size=30),
+        "num1": rng.rand(30),
+        "num2": rng.rand(30),
+    })
+    y = rng.randint(0, 3, size=30)
+    X_enc = TransformToNumerical(min_cat_frequency=1).fit_transform(X)
+    generator = EnsembleGenerator(
+        n_estimators=6,
+        norm_methods=["none", "power"],
+        cat_features=[0],
+        permute_categorical=True,
+        max_num_rows=20,
+        random_state=0,
+    )
+    generator.fit(X_enc, y)
+
+    Xs_ctx, ys_ctx, cat_masks, ds, _ = generator.context_tensors()
+
+    # Old derivation: transform one dummy query row and slice it off.
+    n_feat = generator.unique_filter_.n_features_in_
+    data = generator.transform(np.zeros((1, n_feat)))
+    Xs_ref, ys_ref, cat_masks_ref, ds_ref, _ = (
+        generator.prepare_ensemble_tensors(data)
+    )
+    context_len = ys_ref.shape[1]
+
+    np.testing.assert_array_equal(ys_ctx, ys_ref)
+    np.testing.assert_array_equal(Xs_ctx, Xs_ref[:, :context_len, :])
+    np.testing.assert_array_equal(cat_masks, cat_masks_ref)
+    np.testing.assert_array_equal(ds, ds_ref)
 
   def test_permute_categorical_application(self):
     # Test that transform actually changes the data
@@ -1198,6 +1238,342 @@ class ColumnNameRobustnessTest(absltest.TestCase):
     out = TransformToNumerical().fit_transform(X)
 
     self.assertEqual(out.shape, (4, 5))  # unix-ns + 4 derived features
+
+
+@unittest.skipUnless(HAS_JAX, "JAX is required")
+class CachedPredictTest(absltest.TestCase):
+  """``fit_mode="fit_with_cache"`` must match the default full-forward path.
+
+  With ``fit_mode="fit_with_cache"`` the estimator precomputes the in-context
+  KV cache at fit time (``model.prefill``) and reuses it at predict time
+  (``model.decode``) instead of re-encoding the training context on every call.
+  TabFM conditions queries on the context only (the column embedder's inducing
+  points are computed from train rows, and ICL attention masks queries to the
+  train block), so prefill+decode is numerically equivalent to a full forward
+  pass. These tests pin that equivalence, plus pickle survival and validation.
+  """
+
+  def _tiny_model(self, loss):
+    # float32 (not the bfloat16 default) so prefill+decode agrees with the full
+    # forward pass to floating-point tolerance rather than bf16 coarseness.
+    return tabfm_model.TabFM(
+        loss=loss,
+        max_classes=3,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=1,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        rngs=nnx.Rngs(0),
+        dtype=jnp.float32,
+    )
+
+  def _classification_data(self):
+    rng = np.random.RandomState(0)
+    return (
+        rng.rand(40, 5).astype(np.float32),
+        rng.randint(0, 3, size=40),
+        rng.rand(11, 5).astype(np.float32),
+    )
+
+  def _regression_data(self):
+    rng = np.random.RandomState(1)
+    return (
+        rng.rand(40, 5).astype(np.float32),
+        rng.rand(40).astype(np.float32),
+        rng.rand(11, 5).astype(np.float32),
+    )
+
+  def _mixed_data(self):
+    # A categorical (string) column plus numeric columns, to exercise the
+    # categorical-permutation concat path and non-trivial categorical masks.
+    rng = np.random.RandomState(4)
+    X = pd.DataFrame({
+        "cat": rng.choice(["a", "b", "c"], size=48),
+        "num1": rng.rand(48).astype(np.float32),
+        "num2": rng.rand(48).astype(np.float32),
+    })
+    y = rng.randint(0, 3, size=48)
+    X_test = pd.DataFrame({
+        "cat": rng.choice(["a", "b", "c"], size=10),
+        "num1": rng.rand(10).astype(np.float32),
+        "num2": rng.rand(10).astype(np.float32),
+    })
+    return X, y, X_test
+
+  def test_predict_proba_matches_full_forward(self):
+    X, y, X_test = self._classification_data()
+    # Share one model instance so both estimators see identical weights;
+    # batch_size < n_estimators exercises the per-chunk cache path.
+    model = self._tiny_model("cross_entropy")
+    base = TabFMClassifier(
+        model=model, n_estimators=4, batch_size=2, random_state=0
+    )
+    cached = TabFMClassifier(
+        model=model,
+        n_estimators=4,
+        batch_size=2,
+        random_state=0,
+        fit_mode="fit_with_cache",
+    )
+    base.fit(X, y)
+    cached.fit(X, y)
+
+    np.testing.assert_allclose(
+        cached.predict_proba(X_test), base.predict_proba(X_test), atol=1e-5
+    )
+
+  def test_predict_labels_match_full_forward(self):
+    X, y, X_test = self._classification_data()
+    model = self._tiny_model("cross_entropy")
+    base = TabFMClassifier(
+        model=model, n_estimators=4, batch_size=2, random_state=0
+    )
+    cached = TabFMClassifier(
+        model=model,
+        n_estimators=4,
+        batch_size=2,
+        random_state=0,
+        fit_mode="fit_with_cache",
+    )
+    base.fit(X, y)
+    cached.fit(X, y)
+
+    np.testing.assert_array_equal(cached.predict(X_test), base.predict(X_test))
+
+  def test_cached_classifier_pickle_round_trip(self):
+    X, y, X_test = self._classification_data()
+    cached = TabFMClassifier(
+        model=self._tiny_model("cross_entropy"),
+        n_estimators=4,
+        batch_size=2,
+        random_state=0,
+        fit_mode="fit_with_cache",
+    )
+    cached.fit(X, y)
+    proba = cached.predict_proba(X_test)
+
+    # The context cache holds jax arrays / nnx pytrees and is dropped on pickle;
+    # it must rebuild lazily on the next predict and reproduce the outputs.
+    restored = pickle.loads(pickle.dumps(cached))
+
+    np.testing.assert_allclose(restored.predict_proba(X_test), proba, atol=1e-6)
+
+  def test_regressor_predict_matches_full_forward(self):
+    X, y, X_test = self._regression_data()
+    model = self._tiny_model("rmse")
+    base = TabFMRegressor(
+        model=model, n_estimators=4, batch_size=2, random_state=0
+    )
+    cached = TabFMRegressor(
+        model=model,
+        n_estimators=4,
+        batch_size=2,
+        random_state=0,
+        fit_mode="fit_with_cache",
+    )
+    base.fit(X, y)
+    cached.fit(X, y)
+
+    np.testing.assert_allclose(
+        cached.predict(X_test), base.predict(X_test), atol=1e-5
+    )
+
+  def test_cached_regressor_pickle_round_trip(self):
+    X, y, X_test = self._regression_data()
+    cached = TabFMRegressor(
+        model=self._tiny_model("rmse"),
+        n_estimators=4,
+        batch_size=2,
+        random_state=0,
+        fit_mode="fit_with_cache",
+    )
+    cached.fit(X, y)
+    preds = cached.predict(X_test)
+
+    restored = pickle.loads(pickle.dumps(cached))
+
+    np.testing.assert_allclose(restored.predict(X_test), preds, atol=1e-6)
+
+  def test_invalid_fit_mode_raises(self):
+    X, y, _ = self._classification_data()
+    clf = TabFMClassifier(
+        model=self._tiny_model("cross_entropy"),
+        n_estimators=2,
+        fit_mode="invalid",
+    )
+    with self.assertRaisesRegex(ValueError, "fit_mode"):
+      clf.fit(X, y)
+
+    reg = TabFMRegressor(
+        model=self._tiny_model("rmse"), n_estimators=2, fit_mode="invalid"
+    )
+    with self.assertRaisesRegex(ValueError, "fit_mode"):
+      reg.fit(X, np.random.RandomState(2).rand(40).astype(np.float32))
+
+  def test_cached_path_is_used_and_default_is_not(self):
+    X, y, X_test = self._classification_data()
+    model = self._tiny_model("cross_entropy")
+    base = TabFMClassifier(
+        model=model, n_estimators=4, batch_size=2, random_state=0
+    )
+    cached = TabFMClassifier(
+        model=model,
+        n_estimators=4,
+        batch_size=2,
+        random_state=0,
+        fit_mode="fit_with_cache",
+    )
+    base.fit(X, y)
+    cached.fit(X, y)
+
+    # Only fit_with_cache materializes the context cache.
+    self.assertFalse(hasattr(base, "_context_cache_"))
+    self.assertTrue(hasattr(cached, "_context_cache_"))
+
+    # Cached predict must route through decode, not the full forward pass.
+    with mock.patch.object(
+        cached, "_decode_batch_forward", wraps=cached._decode_batch_forward
+    ) as spy_decode:
+      with mock.patch.object(
+          cached, "_batch_forward", wraps=cached._batch_forward
+      ) as spy_full:
+        cached.predict_proba(X_test)
+    self.assertTrue(spy_decode.called)
+    self.assertFalse(spy_full.called)
+
+  def test_permute_categorical_parity(self):
+    X, y, X_test = self._mixed_data()
+    model = self._tiny_model("cross_entropy")
+    base = TabFMClassifier(
+        model=model,
+        n_estimators=4,
+        batch_size=2,
+        random_state=0,
+        permute_categorical=True,
+    )
+    cached = TabFMClassifier(
+        model=model,
+        n_estimators=4,
+        batch_size=2,
+        random_state=0,
+        permute_categorical=True,
+        fit_mode="fit_with_cache",
+    )
+    base.fit(X, y)
+    cached.fit(X, y)
+
+    np.testing.assert_allclose(
+        cached.predict_proba(X_test), base.predict_proba(X_test), atol=1e-5
+    )
+
+  def test_max_num_rows_parity(self):
+    X, y, X_test = self._classification_data()  # 40 rows
+    model = self._tiny_model("cross_entropy")
+    base = TabFMClassifier(
+        model=model,
+        n_estimators=4,
+        batch_size=2,
+        random_state=0,
+        max_num_rows=25,
+    )
+    cached = TabFMClassifier(
+        model=model,
+        n_estimators=4,
+        batch_size=2,
+        random_state=0,
+        max_num_rows=25,
+        fit_mode="fit_with_cache",
+    )
+    base.fit(X, y)
+    cached.fit(X, y)
+
+    # Per-member row subsampling sets the (constant) context length.
+    self.assertEqual(cached._cache_ctx_len_, 25)
+    np.testing.assert_allclose(
+        cached.predict_proba(X_test), base.predict_proba(X_test), atol=1e-5
+    )
+
+  def test_single_chunk_parity(self):
+    X, y, X_test = self._classification_data()
+    model = self._tiny_model("cross_entropy")
+    base = TabFMClassifier(
+        model=model, n_estimators=4, batch_size=None, random_state=0
+    )
+    cached = TabFMClassifier(
+        model=model,
+        n_estimators=4,
+        batch_size=None,
+        random_state=0,
+        fit_mode="fit_with_cache",
+    )
+    base.fit(X, y)
+    cached.fit(X, y)
+
+    np.testing.assert_allclose(
+        cached.predict_proba(X_test), base.predict_proba(X_test), atol=1e-5
+    )
+
+  def test_refit_rebuilds_cache(self):
+    X, y, X_test = self._classification_data()
+    model = self._tiny_model("cross_entropy")
+    cached = TabFMClassifier(
+        model=model,
+        n_estimators=4,
+        batch_size=2,
+        random_state=0,
+        fit_mode="fit_with_cache",
+    )
+    cached.fit(X, y)
+    first_cache = cached._context_cache_
+
+    # Refitting on different data must rebuild the cache and match a fresh fit.
+    rng = np.random.RandomState(7)
+    X2 = rng.rand(36, 5).astype(np.float32)
+    y2 = rng.randint(0, 3, size=36)
+    cached.fit(X2, y2)
+    self.assertIsNot(cached._context_cache_, first_cache)
+
+    base = TabFMClassifier(
+        model=model, n_estimators=4, batch_size=2, random_state=0
+    )
+    base.fit(X2, y2)
+    np.testing.assert_allclose(
+        cached.predict_proba(X_test), base.predict_proba(X_test), atol=1e-5
+    )
+
+  def test_ensemble_preset_parity(self):
+    X, y, X_test = self._classification_data()
+    model = self._tiny_model("cross_entropy")
+    base = TabFMClassifier.ensemble(
+        model, n_estimators=4, batch_size=2, random_state=0
+    )
+    cached = TabFMClassifier.ensemble(
+        model,
+        n_estimators=4,
+        batch_size=2,
+        random_state=0,
+        fit_mode="fit_with_cache",
+    )
+    base.fit(X, y)
+    cached.fit(X, y)
+
+    np.testing.assert_allclose(
+        cached.predict_proba(X_test), base.predict_proba(X_test), atol=1e-5
+    )
+
+  def test_fit_with_cache_requires_jax_model(self):
+    # The JAX-backend capability check runs before any fitting work.
+    fake_model = mock.Mock(spec=["max_classes"])  # exposes no prefill/decode
+    clf = TabFMClassifier(
+        model=fake_model, n_estimators=2, fit_mode="fit_with_cache"
+    )
+    with self.assertRaisesRegex(NotImplementedError, "prefill"):
+      clf.fit(np.random.RandomState(0).rand(8, 3), np.array([0, 1] * 4))
 
 
 if __name__ == "__main__":
