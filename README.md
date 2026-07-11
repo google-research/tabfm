@@ -150,11 +150,15 @@ python examples/classification_example.py
 
 ---
 
+## Technical Report
+
+A standalone technical report or paper for TabFM is not included in this repository at this time. We plan to update this section with a link if a report describing the model architecture, training pipeline, datasets, and evaluation methodology becomes available.
+
+---
+
 ## Evaluation Results
 
 Our model evaluation results can be found in [results/](results/).
-
----
 
 ## Running Tests
 
