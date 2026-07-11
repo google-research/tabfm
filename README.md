@@ -138,15 +138,22 @@ print("Predicted Prices:", predictions)
 
 ## Examples Directory
 
-You can find runnable scripts for both classification and regression under the [examples/](examples/) folder:
+You can find runnable scripts for classification, regression, TabArena, and a lightweight no-code GUI under the [examples/](examples/) folder:
 *   [classification_example.py](examples/classification_example.py)
 *   [regression_example.py](examples/regression_example.py)
+*   [streamlit_app.py](examples/streamlit_app.py)
 
-To run them, simply execute:
+To run the script examples, simply execute:
 ```bash
 python examples/classification_example.py
 ```
 *(You can edit these files to switch between JAX and PyTorch backends as shown in the comments inside them).*
+
+To run the optional Streamlit GUI demo for CSV workflows, install the examples dependencies and launch:
+```bash
+pip install -e .[examples]
+streamlit run examples/streamlit_app.py
+```
 
 ---
 

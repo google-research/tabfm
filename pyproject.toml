@@ -67,10 +67,12 @@ dev = [
 ]
 
 # Dependencies for the runnable scripts under examples/. The TabArena examples
-# pull datasets from OpenML; scikit-learn (a core dep) supplies the metrics.
+# pull datasets from OpenML; scikit-learn (a core dep) supplies the metrics. The
+# Streamlit app is an optional no-code demo GUI for CSV workflows.
 # Installed through `pip install tabfm[examples]`.
 examples = [
     "openml",
+    "streamlit",
 ]
 
 # GPU support. The base `jax`/`jaxlib` deps are CPU-only; install this extra
