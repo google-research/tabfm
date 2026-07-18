@@ -16,7 +16,7 @@
 
 import os
 import logging
-from typing import Any, Dict, Optional, Tuple, Literal
+from typing import Any, Optional, Tuple, Literal
 from absl import app
 from absl import flags
 import jax.numpy as jnp
