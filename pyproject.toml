@@ -54,6 +54,10 @@ jax = [
     "orbax-checkpoint",
 ]
 pytorch = [
+    # safetensors is required to load the Hugging Face checkpoint
+    # (model.safetensors via PyTorchModelHubMixin); huggingface_hub treats it
+    # as optional and fails with a NameError at load() time without it.
+    "safetensors",
     "torch",
 ]
 
