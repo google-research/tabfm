@@ -21,6 +21,23 @@ To release a new version (e.g. from `1.0.0` -> `2.0.0`):
 
 -->
 
+## [Unreleased]
+
+### Fixed
+
+* PyTorch backend: float64 targets are now cast to float32 before the device
+  move (in both the predict step and context prefill), fixing a crash on Apple
+  MPS, which rejects float64 tensors at transfer time. (#68)
+* Classifier calibration with `max_num_rows`: out-of-fold probabilities are now
+  averaged per row over the ensemble members that actually predicted that row,
+  instead of mixing in all-zero rows from members whose row subsample did not
+  cover it. (#55)
+* `TabFMClassifier`/`TabFMRegressor` are no longer affected by a global
+  `sklearn.set_config(transform_output="pandas")`; internal transformers always
+  produce numpy arrays. (#58)
+* The `pytorch` extra now declares the `safetensors` dependency required to
+  load the Hugging Face checkpoint. (#56)
+
 ## [1.0.1] - 2026-07-09
 
 ### Fixed
@@ -59,5 +76,6 @@ To release a new version (e.g. from `1.0.0` -> `2.0.0`):
 
 * Initial release
 
+[Unreleased]: https://github.com/google-research/tabfm/compare/v1.0.1...HEAD
 [1.0.1]: https://github.com/google-research/tabfm/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/google-research/tabfm/releases/tag/v1.0.0

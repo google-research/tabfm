@@ -27,6 +27,7 @@ Key classes:
 """
 
 import collections
+import functools
 import itertools
 import math
 import random
@@ -56,6 +57,7 @@ except ImportError:
 import pandas as pd
 import scipy.optimize as opt
 import scipy.special
+import sklearn
 from sklearn.base import BaseEstimator
 from sklearn.base import ClassifierMixin
 from sklearn.base import RegressorMixin
@@ -364,6 +366,22 @@ class DatetimeTransformer(BaseEstimator, TransformerMixin):
             series.dt, dt_feature
         ).astype(np.int64)
     return X_datetime.values
+
+
+def _with_default_transform_output(method):
+  """Runs ``method`` under sklearn's default transform-output config.
+
+  User code may globally request pandas transform output via
+  ``sklearn.set_config(transform_output="pandas")``; the numpy-based internal
+  pipeline must not be affected by that global setting.
+  """
+
+  @functools.wraps(method)
+  def wrapper(*args, **kwargs):
+    with sklearn.config_context(transform_output="default"):
+      return method(*args, **kwargs)
+
+  return wrapper
 
 
 class TransformToNumerical(TransformerMixin, BaseEstimator):
@@ -1977,9 +1995,12 @@ def _predict_step_pytorch(
   device = next(model.parameters()).device
 
   X_t = torch.from_numpy(X_batch).to(device, dtype=torch.float32)
-  y_t = torch.from_numpy(y_batch).to(device)
+  # Downcast float64 targets host-side: MPS rejects float64 tensors at
+  # transfer time, so the cast must happen before the device move.
+  y_t = torch.from_numpy(y_batch)
   if y_t.dtype == torch.float64:
     y_t = y_t.to(torch.float32)
+  y_t = y_t.to(device)
 
   batch_size = X_batch.shape[0]
   train_size_t = torch.full(
@@ -2064,9 +2085,12 @@ def _build_context_cache_pytorch(
         Xs_split, ys_split, cat_masks_split, ds_split
     ):
       X_t = torch.from_numpy(X_batch).to(device, dtype=torch.float32)
-      y_t = torch.from_numpy(y_batch).to(device)
+      # Downcast float64 targets host-side: MPS rejects float64 tensors at
+      # transfer time, so the cast must happen before the device move.
+      y_t = torch.from_numpy(y_batch)
       if y_t.dtype == torch.float64:
         y_t = y_t.to(torch.float32)
+      y_t = y_t.to(device)
       cat_mask_t = torch.from_numpy(cat_mask_batch).to(device)
       d_t = torch.from_numpy(ds_batch).to(device)
       _, cache = model.prefill(X_t, y_t, cat_mask=cat_mask_t, d=d_t)
@@ -2417,6 +2441,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     tags.non_deterministic = True
     return tags
 
+  @_with_default_transform_output
   def fit(self, X: Any, y: Any) -> "TabFMClassifier":
     """Fit the classifier to training data.
 
@@ -2508,15 +2533,17 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         and self.active_calibration_method_ != "none"
     ):
       oof_probs = self.predict_oof_proba(cv=self.num_folds_for_cv)
-      val_idx = getattr(self, "oof_val_indices_", None)
-      if val_idx is not None:
-        oof_probs_fit = oof_probs[:, val_idx, :]
-        y_orig_fit = y_orig[val_idx]
-        y_fit = y[val_idx]
-      else:
-        oof_probs_fit = oof_probs
-        y_orig_fit = y_orig
-        y_fit = y
+      # With max_num_rows each ensemble member draws its own row subsample, so
+      # a row may carry OOF predictions from only a subset of members. Keep the
+      # rows at least one member predicted (with per-member coverage recorded
+      # in oof_counts_fit) instead of slicing all members by member 0's
+      # validation indices, which would mix in all-zero rows for the others.
+      oof_counts = self.oof_pred_mask_.sum(axis=0)
+      oof_rows = np.flatnonzero(oof_counts > 0)
+      oof_probs_fit = oof_probs[:, oof_rows, :]
+      oof_counts_fit = oof_counts[oof_rows]
+      y_orig_fit = y_orig[oof_rows]
+      y_fit = y[oof_rows]
 
     if self.enable_nnls and oof_probs_fit is not None:
       n_classes = self.n_classes_
@@ -2551,7 +2578,9 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       if self.enable_nnls:
         P = np.tensordot(self.ensemble_weights_, oof_probs_fit, axes=(0, 0))
       else:
-        P = np.mean(oof_probs_fit, axis=0)
+        # Average each row over the members that predicted it; unpredicted
+        # member entries are zero and must not drag the mean toward zero.
+        P = oof_probs_fit.sum(axis=0) / oof_counts_fit[:, None]
       assert P.shape == (len(y_fit), self.n_classes_), (
           f"Expected calibration input shape {(len(y_fit), self.n_classes_)},"
           f" got {P.shape}"
@@ -2922,6 +2951,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       state.pop(attr, None)
     return state
 
+  @_with_default_transform_output
   @jt.typed
   def predict_oof_proba(self, cv: int = 5) -> jt.Float[Array | np.ndarray, "E N K"]:
     """Perform out-of-fold predictions on the training set for each ensemble member."""
@@ -2957,6 +2987,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       folds_to_run = folds_base
 
     outputs_oof = np.zeros((n_estimators, N, n_classes))
+    oof_mask = np.zeros((n_estimators, N), dtype=bool)
 
     self.oof_val_indices_ = None
     for fold_idx, (train_fold, val_fold) in enumerate(folds_to_run):
@@ -2988,7 +3019,9 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
             out_i, axis=-1, temperature=self.softmax_temperature
         )
         outputs_oof[i, val_indices_list[i]] = out_i
+        oof_mask[i, val_indices_list[i]] = True
 
+    self.oof_pred_mask_ = oof_mask
     return outputs_oof
 
   @jt.typed
@@ -3165,6 +3198,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
 
     return probs
 
+  @_with_default_transform_output
   @jt.typed
   def predict_proba(self, X: Any) -> jt.Float[Array | np.ndarray, "T K"]:
     """Predict class probabilities for test samples.
@@ -3191,6 +3225,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     logits = self._predict_proba_internal(X)
     return self._process_logits(logits)
 
+  @_with_default_transform_output
   @jt.typed
   def predict(self, X: Any) -> np.ndarray:
     """Predict class labels for test samples.
@@ -3395,6 +3430,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     """Mark regressor as non-deterministic to bypass certain sklearn tests."""
     return dict(non_deterministic=True)
 
+  @_with_default_transform_output
   def fit(self, X: Any, y: Any) -> "TabFMRegressor":
     """Fit the regressor to training data.
 
@@ -3804,6 +3840,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       state.pop(attr, None)
     return state
 
+  @_with_default_transform_output
   @jt.typed
   def predict_oof(self, cv: int = 5) -> jt.Float[Array | np.ndarray, "E N"]:
     """Perform out-of-fold predictions on the training set for each ensemble member."""
@@ -3923,6 +3960,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       avg_predictions = np.mean(predictions_scaled, axis=0)
       return self._inverse_transform_y(avg_predictions)
 
+  @_with_default_transform_output
   @jt.typed
   def predict(self, X: Any) -> jt.Float[Array | np.ndarray, "T"]:
     """Predict regression target for test samples.
