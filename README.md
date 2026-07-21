@@ -50,6 +50,14 @@ For a complete list of pinned dependencies and versions, please see [requirement
 
 We provide pre-trained weights for the **TabFM v1.0.0** release. The library handles downloading and loading these weights automatically. You can choose to load the model using either the JAX or PyTorch backend.
 
+> [!IMPORTANT]
+> **Licensing:** the code in this repository is licensed under
+> [Apache-2.0](LICENSE), but the pre-trained weights that the Quick Start
+> downloads from Hugging Face are licensed separately under
+> [`tabfm-non-commercial-v1.0`](https://huggingface.co/google/tabfm-1.0.0-pytorch),
+> which does **not** permit commercial or production use. Running the examples
+> below with the default weights is therefore restricted to non-commercial use.
+
 ### 1. Classification Example
 
 ```python
