@@ -45,6 +45,32 @@ py_test(
 )
 
 py_library(
+    name = "generation",
+    srcs = ["generation.py"],
+    visibility = ["//tabfm:__subpackages__"],
+    deps = [
+        ":classifier_and_regressor",
+        "@pip//jaxtyping",
+        "@pip//numpy",
+        "@pip//pandas",
+    ],
+)
+
+py_test(
+    name = "generation_test",
+    srcs = ["generation_test.py"],
+    deps = [
+        ":generation",
+        "//tabfm/src/jax:model",
+        "@pip//absl_py",
+        "@pip//flax",
+        "@pip//jax",
+        "@pip//numpy",
+        "@pip//pandas",
+    ],
+)
+
+py_library(
     name = "torch_convert",
     srcs = ["hugging_face/torch_convert.py"],
     deps = [
