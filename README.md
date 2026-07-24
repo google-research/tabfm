@@ -134,13 +134,56 @@ predictions = reg.predict(X_test)
 print("Predicted Prices:", predictions)
 ```
 
+### 3. Synthetic Data Generation
+
+TabFM can also act as a generative model: `TabFMDataGenerator` samples
+entirely new rows that mimic a reference dataset. It factorizes the joint
+distribution over columns with the chain rule and samples each column from a
+TabFM classifier's predictive distribution. Numerical columns are sampled at
+fine resolution via hierarchical quantile refinement (`n_bins ** n_levels`
+equal-mass bins — 100 by default, 1000 with `n_levels=3`), with the value
+drawn uniformly within the sampled bin.
+
+```python
+import pandas as pd
+from tabfm import TabFMDataGenerator
+
+# Choose your backend:
+
+# OPTION A: JAX Backend
+from tabfm import tabfm_v1_0_0_jax as tabfm_v1_0_0
+
+# OPTION B: PyTorch Backend
+# from tabfm import tabfm_v1_0_0_pytorch as tabfm_v1_0_0
+
+# Generation only needs the classification model.
+model = tabfm_v1_0_0.load()
+
+X = pd.DataFrame({
+    "age": [25.0, 45.0, 35.0, 50.0, 28.0, 41.0],
+    "job": ["engineer", "manager", "engineer", "manager", "analyst", "analyst"],
+    "income": [80000, 120000, 90000, 130000, 70000, 100000],
+})
+
+gen = TabFMDataGenerator(model=model, random_state=42)
+gen.fit(X, categorical_features=["job"])
+synthetic = gen.sample(n_samples=100, t=1.0)  # t < 1 => closer to the modes
+print(synthetic.head())
+```
+
+Categorical columns support up to the model's `max_classes` distinct values
+directly (rarer values are merged and re-sampled empirically). Generated rows
+mimic the reference distribution but carry no formal privacy guarantee.
+
 ---
 
 ## Examples Directory
 
-You can find runnable scripts for both classification and regression under the [examples/](examples/) folder:
+You can find runnable scripts for classification, regression and synthetic
+data generation under the [examples/](examples/) folder:
 *   [classification_example.py](examples/classification_example.py)
 *   [regression_example.py](examples/regression_example.py)
+*   [synthetic_data_example.py](examples/synthetic_data_example.py)
 
 To run them, simply execute:
 ```bash
