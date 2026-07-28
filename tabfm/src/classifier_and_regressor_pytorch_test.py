@@ -17,10 +17,43 @@ import unittest
 from unittest import mock
 import numpy as np
 import pandas as pd
+import sklearn
 import torch
 
 from tabfm.src.pytorch import model as pytorch_model
+from tabfm.src import classifier_and_regressor
 from tabfm.src.classifier_and_regressor import TabFMClassifier, TabFMRegressor
+
+
+def _small_model(is_classifier: bool, max_classes: int) -> pytorch_model.TabFM:
+  return pytorch_model.TabFM(
+      embed_dim=8,
+      max_classes=max_classes,
+      col_num_blocks=1,
+      col_nhead=2,
+      col_num_inds=8,
+      row_num_blocks=1,
+      row_nhead=2,
+      row_num_cls=2,
+      icl_num_blocks=1,
+      icl_nhead=2,
+      ff_factor=2,
+      feature_group_size=2,
+      is_classifier=is_classifier,
+  )
+
+
+class _DTypeCaptureModel(torch.nn.Module):
+  """Records the dtype of the target tensor handed to the model."""
+
+  def __init__(self):
+    super().__init__()
+    self.param = torch.nn.Parameter(torch.zeros(1))
+    self.seen_y_dtype = None
+
+  def forward(self, X, y, train_size, cat_mask=None, d=None):
+    self.seen_y_dtype = y.dtype
+    return torch.zeros(X.shape[0], X.shape[1], 1)
 
 
 class PyTorchClassifierRegressorTest(unittest.TestCase):
@@ -135,6 +168,78 @@ class PyTorchClassifierRegressorTest(unittest.TestCase):
     preds_cached = cached_reg.predict(X)
     self.assertEqual(preds_cached.shape, (10,))
     np.testing.assert_allclose(preds_cached, preds, rtol=1e-5, atol=1e-6)
+
+  def test_predict_step_casts_float64_targets_before_device_move(self):
+    model = _DTypeCaptureModel()
+    classifier_and_regressor._predict_step_pytorch(
+        model,
+        np.random.rand(2, 6, 3).astype(np.float32),
+        np.random.rand(2, 4),  # float64, numpy's default float dtype
+        4,
+        None,
+        None,
+    )
+    self.assertEqual(model.seen_y_dtype, torch.float32)
+
+  def test_calibration_with_max_num_rows_uses_valid_probabilities(self):
+    np.random.seed(0)
+    model = _small_model(is_classifier=True, max_classes=3)
+
+    orig_fit_calibration = TabFMClassifier._fit_calibration
+    captured = {}
+
+    def spy(clf_self, P, y_fit):
+      captured["P"] = np.asarray(P)
+      return orig_fit_calibration(clf_self, P, y_fit)
+
+    with mock.patch.object(TabFMClassifier, "_fit_calibration", spy):
+      clf = TabFMClassifier(
+          model=model,
+          n_estimators=3,
+          batch_size=3,
+          random_state=0,
+          max_num_rows=30,
+          min_rows_for_single_val_split=1,
+          binary_calibration_method="platt",
+      )
+      X = np.random.rand(60, 3)
+      y = np.random.randint(0, 2, size=60)
+      clf.fit(X, y)
+
+    # Each member subsamples rows independently, so the calibration inputs
+    # must be averaged per row over the members that predicted it — every
+    # row must still be a probability vector.
+    P = captured["P"]
+    self.assertGreater(P.shape[0], 0)
+    np.testing.assert_allclose(P.sum(axis=1), 1.0, rtol=1e-5)
+
+  def test_fit_predict_with_sklearn_pandas_output(self):
+    np.random.seed(42)
+    sklearn.set_config(transform_output="pandas")
+    try:
+      reg = TabFMRegressor(
+          model=_small_model(is_classifier=False, max_classes=1),
+          n_estimators=2,
+          batch_size=2,
+          random_state=42,
+      )
+      X = np.random.rand(10, 3)
+      y = np.random.rand(10)
+      reg.fit(X, y)
+      self.assertEqual(reg.predict(X).shape, (10,))
+
+      clf = TabFMClassifier(
+          model=_small_model(is_classifier=True, max_classes=3),
+          n_estimators=2,
+          batch_size=2,
+          random_state=42,
+      )
+      X_df = pd.DataFrame(np.random.rand(10, 3), columns=["a", "b", "c"])
+      y_cls = np.array([0, 1, 2, 0, 1, 2, 0, 1, 2, 0])
+      clf.fit(X_df, y_cls)
+      self.assertEqual(clf.predict_proba(X_df).shape, (10, 3))
+    finally:
+      sklearn.set_config(transform_output="default")
 
 
 class PyTorchModelPickleTest(unittest.TestCase):

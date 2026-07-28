@@ -54,6 +54,7 @@ jax = [
     "orbax-checkpoint",
 ]
 pytorch = [
+    "safetensors",
     "torch",
 ]
 
