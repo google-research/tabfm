@@ -1,0 +1,29 @@
+#!/bin/bash
+#PBS -N tabfm_train
+#PBS -q <GPU_QUEUE_NAME>            # TODO: qstat -Q 로 확인한 실제 GPU 큐 이름으로 교체
+#PBS -l select=1:ncpus=8:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o tabfm_train.log
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+
+# 1) CUDA 모듈 로드 (버전은 KSC에서 `module avail cuda`로 확인 후 맞출 것)
+module load cuda/12.1
+
+# 2) conda 환경 활성화
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate tabfm
+
+# 3) 로컬 검증용 environment.yml은 CPU jax를 깔았음 -> GPU용으로 교체
+#    (이미 tabfm env에 GPU jax가 설치돼 있다면 아래 줄은 건너뛰어도 됨)
+pip install -U "jax[cuda12]"
+
+# 4) GPU 인식 확인 (로그에 GpuDevice가 안 보이면 여기서 멈추고 CUDA/jax 버전 조합을 다시 볼 것)
+python -c "import jax; print('JAX devices:', jax.devices())"
+
+# 5) 실제 학습/파인튜닝 명령 (README의 실제 학습 스크립트로 교체)
+#    아래는 로컬에서 검증된 최소 스모크 테스트 예시 -- 실제 job에서는
+#    README에 있는 fine-tuning/inference 진입점으로 바꿀 것.
+PYTHONPATH=. python3 -m unittest tabfm.src.classifier_and_regressor_test -v
