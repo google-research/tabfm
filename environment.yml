@@ -1,0 +1,108 @@
+# Reproducible local (CPU-only, macOS/Linux) environment for TabFM.
+#
+# Verified on: macOS arm64, Python 3.11, JAX backend, CPU only (no GPU on
+# this machine). Confirms env build + tiny-model fit/predict pipeline runs
+# end-to-end (see tabfm/src/classifier_and_regressor_test.py, run via
+# `PYTHONPATH=. python3 -m unittest tabfm.src.classifier_and_regressor_test`).
+#
+# Create with:
+#   conda env create -f environment.yml
+#   conda activate tabfm
+#
+# *** IMPORTANT for KSC (GPU cluster) submission ***
+# This file installs the CPU-only JAX/jaxlib build (the default PyPI
+# `jax`/`jaxlib` wheels have no CUDA support). Before submitting a real
+# training job on KSC:
+#   1. Replace the `jax`/`jaxlib` pip lines below with the CUDA12 plugin, e.g.:
+#        pip install -U "jax[cuda12]"
+#      (this matches the `cuda` extra already defined in tabfm/pyproject.toml:
+#       `pip install -e .[jax,cuda]`).
+#   2. Make sure the CUDA/cuDNN versions available on the KSC compute node
+#      match what the jax[cuda12] wheel expects (check `jax.print_environment_info()`).
+#   3. If using the PyTorch backend instead (`pip install -e .[pytorch]`),
+#      swap `torch` for a CUDA build matching the cluster's CUDA version,
+#      e.g. `pip install torch --index-url https://download.pytorch.org/whl/cu121`
+#      (this repo's requirements.txt pins `torch==2.12.1+cpu` from the CPU
+#      wheel index, which is unrelated to GPU capability -- for GPU on KSC use
+#      the correct `cuXXX` wheel index for that node's CUDA version instead).
+#   4. Re-run `python -c "import jax; print(jax.devices())"` (or the torch
+#      equivalent `torch.cuda.is_available()`) on the KSC node to confirm the
+#      accelerator is visible before launching the real job.
+name: tabfm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - absl-py==2.5.0
+      - aiofiles==25.1.0
+      - anyio==4.14.2
+      - argon2-cffi==25.1.0
+      - argon2-cffi-bindings==25.1.0
+      - certifi==2026.7.22
+      - cffi==2.1.1
+      - charset-normalizer==3.4.9
+      - chex==0.1.92
+      - click==8.4.2
+      - einops==0.8.2
+      - etils==1.14.0
+      - filelock==3.32.2
+      - flax==0.12.8
+      - fsspec==2026.7.0
+      - h11==0.16.0
+      - hf-xet==1.6.0
+      - httpcore==1.0.9
+      - httpx==0.28.1
+      - huggingface_hub==1.27.0
+      - humanize==4.16.0
+      - idna==3.18
+      - jax==0.10.2
+      - jaxlib==0.10.2
+      - jaxtyping==0.2.38
+      - joblib==1.5.3
+      - liac-arff==2.5.0
+      - markdown-it-py==4.2.0
+      - mdurl==0.1.2
+      - minio==7.2.20
+      - ml_dtypes==0.5.4
+      - msgpack==1.2.1
+      - narwhals==2.24.0
+      - numpy==2.4.6
+      - openml==0.15.1
+      - opt_einsum==3.4.0
+      - optax==0.2.8
+      - orbax-checkpoint==0.12.3
+      - packaging==26.2
+      - pandas==3.0.5
+      - prometheus_client==0.26.0
+      - protobuf==7.35.1
+      - psutil==7.2.2
+      - pyarrow==25.0.1
+      - pycparser==3.0
+      - pycryptodome==3.23.0
+      - Pygments==2.20.0
+      - python-dateutil==2.9.0.post0
+      - PyYAML==6.0.3
+      - requests==2.34.2
+      - rich==15.0.0
+      - scikit-learn==1.9.0
+      - scipy==1.17.1
+      - simplejson==4.1.1
+      - six==1.17.0
+      - tensorstore==0.1.85
+      - threadpoolctl==3.6.0
+      - toolz==1.1.0
+      - tqdm==4.70.0
+      - treescope==0.1.10
+      - typeguard==2.13.3
+      - typing_extensions==4.16.0
+      - urllib3==2.7.0
+      - uvloop==0.22.1
+      - wadler_lindig==0.1.7
+      - xmltodict==1.0.4
+      - zipp==4.1.0
+      # Editable install of the local checkout itself (adds the `tabfm`
+      # package + console entry points on top of the pinned deps above).
+      # Run this file from the repo root so the relative path resolves.
+      - -e .
