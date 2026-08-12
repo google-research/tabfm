@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -N tabfm_train
-#PBS -q <GPU_QUEUE_NAME>            # TODO: qstat -Q 로 확인한 실제 GPU 큐 이름으로 교체
-#PBS -l select=1:ncpus=8:ngpus=1
+#PBS -q cas_v100_2                  # qstat -Q 확인됨 (2026-08-13). 단일 GPU면 충분한 규모 -- 필요시 amd_a100_4로 교체
+#PBS -l select=1:ncpus=4:ngpus=1    # TODO: qstat -Qf cas_v100_2 로 노드당 ncpus/ngpus 비율, 최대 walltime 확인 후 조정
 #PBS -l walltime=24:00:00
 #PBS -j oe
 #PBS -o tabfm_train.log
