@@ -3363,12 +3363,20 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     Args:
       x: Input logit array of any shape.
       axis: Axis along which to compute softmax.
-      temperature: Scaling factor applied before the softmax; values < 1
-        produce a sharper distribution.
+      temperature: Strictly positive scaling factor applied before the softmax;
+        values < 1 produce a sharper distribution.
 
     Returns:
       Softmax probabilities with the same shape as ``x``.
+
+    Raises:
+      ValueError: If ``temperature`` is not greater than zero.
     """
+    if temperature <= 0:
+      raise ValueError(
+          f"temperature must be greater than 0. Got {temperature}."
+      )
+
     x = x / temperature
     # Subtract max for numerical stability
     x_max = np.max(x, axis=axis, keepdims=True)
