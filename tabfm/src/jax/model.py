@@ -41,13 +41,18 @@ import enum
 import typing
 
 import einops
+
 rearrange = einops.rearrange
 repeat = einops.repeat
 from flax import nnx
 from flax.nnx import Module
 import jax
 import jax.numpy as jnp
-import jaxtyping as jt; import typeguard; import numpy as np; jt.typed = jt.jaxtyped(typechecker=typeguard.typechecked)
+import jaxtyping as jt
+import typeguard
+import numpy as np
+
+jt.typed = jt.jaxtyped(typechecker=typeguard.typechecked)
 
 Array = jax.Array | np.ndarray
 DType = Any
@@ -57,12 +62,32 @@ Float = jt.Float
 from . import memory_efficient_attention
 
 
+# Run the SPLASH attention kernel in Pallas interpret mode (CPU-executable,
+# slow; for tests only). Set before the first predict.
+SPLASH_INTERPRET = False
+
+
+def set_splash_interpret(value):
+  """Enables/disables Pallas interpret mode for SPLASH attention."""
+  global SPLASH_INTERPRET
+  SPLASH_INTERPRET = value
+
 
 class AttentionImplementation(str, enum.Enum):
   JAX = 'jax'
   # vmaps jax.nn.dot_product_attention over the head dimension to save memory
   JAX_VMAP_ON_HEAD_DIM = 'jax_vmap_on_head_dim'
   FLASH = 'flash'
+  # Fused cuDNN flash attention (GPU only, fp16/bf16). Much faster than FLASH
+  # on long sequences; masks must be key-prefix (padding) masks, which is the
+  # only mask shape TabFM uses. Head dims > 128 need Hopper (sm90) or later --
+  # TabFM v1.0.0's ICL stage uses head dim 256, so 'cudnn' for the ICL layers
+  # requires an H100-class GPU (cuDNN raises NotImplementedError otherwise).
+  CUDNN = 'cudnn'
+  # Fused Pallas flash attention (TPU only, the analogue of CUDNN on GPU).
+  # fp32 softmax accumulation; masks must be key-prefix (padding) masks,
+  # which are expressed via splash segment ids.
+  SPLASH = 'splash'
   NONE = 'none'
 
 
@@ -82,7 +107,9 @@ def default(val: Any, d: Any) -> Any:
 
 
 @jt.typed
-def rotate_half(x: jt.Float[jax.Array | np.ndarray, '*B D_r']) -> jt.Float[jax.Array | np.ndarray, '*B D_r']:
+def rotate_half(
+    x: jt.Float[jax.Array | np.ndarray, '*B D_r'],
+) -> jt.Float[jax.Array | np.ndarray, '*B D_r']:
   """Rotates half of the input tensor's dimensions for rotary positional embeddings.
 
   This operation splits the last dimension into two halves and swaps them,
@@ -178,7 +205,9 @@ class PerDimScale(nnx.Module):
     self.per_dim_scale = nnx.Param(jnp.zeros(shape=(num_dims,)))
 
   @jt.typed
-  def __call__(self, x: jt.Float[jax.Array | np.ndarray, '*B L']) -> jt.Float[jax.Array | np.ndarray, '*B L']:
+  def __call__(
+      self, x: jt.Float[jax.Array | np.ndarray, '*B L']
+  ) -> jt.Float[jax.Array | np.ndarray, '*B L']:
     """Applies per-dimension scaling.
 
     Args:
@@ -247,7 +276,7 @@ class RotaryEmbedding(nnx.Module):
     self.interpolate_factor = interpolate_factor
     self.dtype = dtype
 
-    assert dim >=2, f'dim must be at least 2. Got {dim}'
+    assert dim >= 2, f'dim must be at least 2. Got {dim}'
     # Apply theta rescaling based on NTK-aware scaling for longer sequence lengths
     theta *= theta_rescale_factor ** (dim / (dim - 2))
 
@@ -257,8 +286,7 @@ class RotaryEmbedding(nnx.Module):
     elif freqs_for == 'lang':
       # Language-based frequencies (standard RoPE formulation)
       freqs_init = 1.0 / (
-          theta
-          ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim)
+          theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim)
       )
     elif freqs_for == 'pixel':
       # Pixel-based frequencies (often used for images)
@@ -432,7 +460,9 @@ class OneHotAndLinear(nnx.Module):
     self.dtype = dtype
 
   @jt.typed
-  def __call__(self, src: jt.Shaped[jax.Array | np.ndarray, '... T']) -> jt.Float[jax.Array | np.ndarray, '... T E']:
+  def __call__(
+      self, src: jt.Shaped[jax.Array | np.ndarray, '... T']
+  ) -> jt.Float[jax.Array | np.ndarray, '... T E']:
     """Transforms integer indices to dense embeddings.
 
     Args:
@@ -489,7 +519,11 @@ class MLP(nnx.Module):
     for hidden_dim in hidden_dims:
       self.layers.append(
           nnx.Linear(
-              prev_dim, hidden_dim, use_bias=use_bias, rngs=rngs, dtype=self.dtype
+              prev_dim,
+              hidden_dim,
+              use_bias=use_bias,
+              rngs=rngs,
+              dtype=self.dtype,
           )
       )
       self.layers.append(act_fn)
@@ -503,7 +537,9 @@ class MLP(nnx.Module):
       )
 
   @jt.typed
-  def __call__(self, x: jt.Float[jax.Array | np.ndarray, '... L_in']) -> jt.Float[jax.Array | np.ndarray, '... L_out']:
+  def __call__(
+      self, x: jt.Float[jax.Array | np.ndarray, '... L_in']
+  ) -> jt.Float[jax.Array | np.ndarray, '... L_out']:
     """Forward pass through the MLP.
 
     Args:
@@ -525,10 +561,14 @@ def _logn(n: int, dtype: jnp.dtype) -> jax.Array | np.ndarray:
 
 @jt.typed
 def _extract_kv_from_cache(
-    cached_kv: Tuple[jt.Float[jax.Array | np.ndarray, 'B T N D'],
-                     jt.Float[jax.Array | np.ndarray, 'B T N D']]
-) -> Tuple[jt.Float[jax.Array | np.ndarray, 'B T N D'],
-           jt.Float[jax.Array | np.ndarray, 'B T N D']]:
+    cached_kv: Tuple[
+        jt.Float[jax.Array | np.ndarray, 'B T N D'],
+        jt.Float[jax.Array | np.ndarray, 'B T N D'],
+    ],
+) -> Tuple[
+    jt.Float[jax.Array | np.ndarray, 'B T N D'],
+    jt.Float[jax.Array | np.ndarray, 'B T N D'],
+]:
   """Extracts key and value tensors from the cache.
 
   Args:
@@ -547,9 +587,11 @@ def _extract_kv_from_cache(
 @jt.typed
 def _encode_kv_into_cache(
     k: jt.Float[jax.Array | np.ndarray, 'B T N D'],
-    v: jt.Float[jax.Array | np.ndarray, 'B T N D']
-) -> Tuple[jt.Float[jax.Array | np.ndarray, 'B T N D'],
-           jt.Float[jax.Array | np.ndarray, 'B T N D']]:
+    v: jt.Float[jax.Array | np.ndarray, 'B T N D'],
+) -> Tuple[
+    jt.Float[jax.Array | np.ndarray, 'B T N D'],
+    jt.Float[jax.Array | np.ndarray, 'B T N D'],
+]:
   """Encodes key and value tensors into the cache.
 
   Args:
@@ -600,7 +642,6 @@ class MultiheadAttention(nnx.Module):
     self.attention_impl = attention_impl
     self.dtype = dtype
 
-
     assert (
         self.head_dim * num_heads == self.embed_dim
     ), 'embed_dim must be divisible by num_heads'
@@ -623,13 +664,25 @@ class MultiheadAttention(nnx.Module):
     # if self.out_proj.bias is not None:
     #     self.out_proj.bias[...] = jnp.zeros_like(self.out_proj.bias[...])
     self.q_proj = nnx.Linear(
-        self.embed_dim, self.embed_dim, use_bias=use_bias, rngs=rngs, dtype=self.dtype
+        self.embed_dim,
+        self.embed_dim,
+        use_bias=use_bias,
+        rngs=rngs,
+        dtype=self.dtype,
     )
     self.k_proj = nnx.Linear(
-        self.embed_dim, self.embed_dim, use_bias=use_bias, rngs=rngs, dtype=self.dtype
+        self.embed_dim,
+        self.embed_dim,
+        use_bias=use_bias,
+        rngs=rngs,
+        dtype=self.dtype,
     )
     self.v_proj = nnx.Linear(
-        self.embed_dim, self.embed_dim, use_bias=use_bias, rngs=rngs, dtype=self.dtype
+        self.embed_dim,
+        self.embed_dim,
+        use_bias=use_bias,
+        rngs=rngs,
+        dtype=self.dtype,
     )
     self.query_ln = nnx.RMSNorm(self.head_dim, rngs=rngs, dtype=self.dtype)
     self.key_ln = nnx.RMSNorm(self.head_dim, rngs=rngs, dtype=self.dtype)
@@ -641,7 +694,9 @@ class MultiheadAttention(nnx.Module):
       query: jt.Float[jax.Array | np.ndarray, 'B T E'],
       key: jt.Float[jax.Array | np.ndarray, 'B T_src E'] | None,
       value: jt.Float[jax.Array | np.ndarray, 'B T_src E'] | None,
-      attn_mask: Optional[jt.Bool[jax.Array | np.ndarray, 'B #N #T T_src']] = None,
+      attn_mask: Optional[
+          jt.Bool[jax.Array | np.ndarray, 'B #N #T T_src']
+      ] = None,
       rope: Optional[RotaryEmbedding] = None,
       cached_kv: Optional[
           Tuple[
@@ -656,7 +711,9 @@ class MultiheadAttention(nnx.Module):
           jt.Float[jax.Array | np.ndarray, 'B T E'],  # Output tensor.
           Tuple[
               jt.Float[jax.Array | np.ndarray, 'B T_src N D'],  # New key cache
-              jt.Float[jax.Array | np.ndarray, 'B T_src N D'],  # New value cache
+              jt.Float[
+                  jax.Array | np.ndarray, 'B T_src N D'
+              ],  # New value cache
           ],
       ],
   ]:
@@ -689,7 +746,8 @@ class MultiheadAttention(nnx.Module):
 
     if attn_mask is not None:
       assert attn_mask.shape[0] == batch_size, (
-          f'attn_mask batch size must match query batch size: {attn_mask.shape[0]} != {batch_size}'
+          'attn_mask batch size must match query batch size:'
+          f' {attn_mask.shape[0]} != {batch_size}'
       )
     if self.attention_impl == AttentionImplementation.NONE:
       # For None attention, kv cache is empty.
@@ -705,7 +763,9 @@ class MultiheadAttention(nnx.Module):
     # 2. Handle K, V
     if cached_kv is not None:
       assert key is None, f'key must be None if cached_kv is not None {key=}'
-      assert value is None, f'value must be None if cached_kv is not None {value=}.'
+      assert (
+          value is None
+      ), f'value must be None if cached_kv is not None {value=}.'
       k, v = _extract_kv_from_cache(cached_kv)
       src_len = k.shape[-3]  # (Batch, Seq, Head, Dim)
     else:
@@ -731,7 +791,6 @@ class MultiheadAttention(nnx.Module):
       k = self.key_ln(k)
     q = self.per_dim_scale(q)
 
-
     new_kv = _encode_kv_into_cache(k, v)
     if attn_mask is not None:
       assert attn_mask.ndim == 4, 'attn_mask must be 4D'
@@ -754,6 +813,77 @@ class MultiheadAttention(nnx.Module):
           query_chunk_size=128 if tgt_len >= 128 else tgt_len,
           key_chunk_size=128 if src_len >= 128 else src_len,
       )
+    elif self.attention_impl == AttentionImplementation.CUDNN:
+      # Fused cuDNN flash attention: never materializes the [T, T_src] score
+      # matrix and runs orders of magnitude faster than the chunked FLASH
+      # path on long sequences (e.g. 24 ICL blocks at 135k-row context:
+      # ~137s -> ~1.6s on an H100).
+      #
+      # cuDNN cannot take TabFM's broadcastable boolean masks (it requires a
+      # full [B, N, T, T_src] mask, which would materialize T*T_src bools).
+      # Every mask in this model is a key-prefix (padding) mask -- "attend to
+      # the first n keys" -- so it maps exactly onto cuDNN's variable
+      # sequence-length support instead.
+      kv_seq_lens = None
+      if attn_mask is not None:
+        kv_seq_lens = (
+            attn_mask.reshape(batch_size, -1)[:, -src_len:]
+            .sum(-1)
+            .astype(jnp.int32)
+        )
+      attn_output = jax.nn.dot_product_attention(
+          query=q,
+          key=k,
+          value=v,
+          scale=1.0,
+          key_value_seq_lengths=kv_seq_lens,
+          implementation='cudnn',
+      )
+    elif self.attention_impl == AttentionImplementation.SPLASH:
+      # Fused Pallas splash-attention kernel (TPU; CPU only via the interpret
+      # knob below, for tests). The kernel applies no internal scaling, which
+      # matches this module's convention (scaling is folded into q). TabFM's
+      # boolean masks are always key-prefix (padding) masks; they are
+      # expressed via segment ids: queries carry segment 1, valid keys 1,
+      # padded keys 0, and splash only attends within equal segments.
+      from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel as _sak  # pylint: disable=g-import-not-at-top
+      from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as _sam  # pylint: disable=g-import-not-at-top
+
+      if attn_mask is not None:
+        kv_valid = attn_mask.reshape(batch_size, -1)[:, -src_len:]
+      else:
+        kv_valid = jnp.ones((batch_size, src_len), dtype=bool)
+      seg_q = jnp.ones((batch_size, tgt_len), jnp.int32)
+      seg_kv = kv_valid.astype(jnp.int32)
+
+      # Sequence lengths are 128-multiples in this codebase (inputs are padded
+      # to the chunked-attention granularity), so fixed 128 blocks divide.
+      blocks = _sak.BlockSizes(
+          block_q=min(128, tgt_len), block_kv=min(128, src_len)
+      )
+      kernel = _sak.make_splash_mha(
+          _sam.MultiHeadMask(
+              [_sam.FullMask((tgt_len, src_len))] * self.num_heads
+          ),
+          block_sizes=blocks,
+          head_shards=1,
+          q_seq_shards=1,
+          interpret=SPLASH_INTERPRET,
+      )
+
+      def _one(q_i, k_i, v_i, sq_i, skv_i):
+        return kernel(
+            q_i, k_i, v_i, segment_ids=_sak.SegmentIds(q=sq_i, kv=skv_i)
+        )
+
+      # splash takes [num_heads, seq, head_dim]; vmap over the batch axis.
+      attn_output = jax.vmap(_one)(
+          q.transpose(0, 2, 1, 3),
+          k.transpose(0, 2, 1, 3),
+          v.transpose(0, 2, 1, 3),
+          seg_q,
+          seg_kv,
+      ).transpose(0, 2, 1, 3)
     elif self.attention_impl == AttentionImplementation.JAX:
       attn_output = jax.nn.dot_product_attention(
           query=q,
@@ -788,8 +918,7 @@ class MultiheadAttention(nnx.Module):
       attn_output = jnp.swapaxes(attn_output_h, 0, -2)
     else:
       raise ValueError(
-          'Unsupported attention implementation: %s'
-          % self.attention_impl
+          'Unsupported attention implementation: %s' % self.attention_impl
       )
 
     # 6. Reshape and final projection
@@ -909,17 +1038,28 @@ class MultiheadAttentionBlock(nnx.Module):
       q: jt.Float[jax.Array | np.ndarray, 'B T E'],
       k: Optional[jt.Float[jax.Array | np.ndarray, 'B T_src E']] = None,
       v: Optional[jt.Float[jax.Array | np.ndarray, 'B T_src E']] = None,
-      attn_mask: Optional[jt.Bool[jax.Array | np.ndarray, 'B #N #T T_src']] = None,
+      attn_mask: Optional[
+          jt.Bool[jax.Array | np.ndarray, 'B #N #T T_src']
+      ] = None,
       rope: Optional[RotaryEmbedding] = None,
       *,
-      cached_kv: Optional[Tuple[jt.Float[jax.Array | np.ndarray, 'B T_src N D'],
-                                jt.Float[jax.Array | np.ndarray, 'B T_src N D']]] = None,
+      cached_kv: Optional[
+          Tuple[
+              jt.Float[jax.Array | np.ndarray, 'B T_src N D'],
+              jt.Float[jax.Array | np.ndarray, 'B T_src N D'],
+          ]
+      ] = None,
       return_kv: bool = False,
-  ) -> Union[jt.Float[jax.Array | np.ndarray, 'B T E'],   # output
-             Tuple[jt.Float[jax.Array | np.ndarray, 'B T E'],  # output
-                   Tuple[jt.Float[jax.Array | np.ndarray, 'B T_src N D'],  # key cache
-                         jt.Float[jax.Array | np.ndarray, 'B T_src N D']]]  # value cache
-             ]:
+  ) -> Union[
+      jt.Float[jax.Array | np.ndarray, 'B T E'],  # output
+      Tuple[
+          jt.Float[jax.Array | np.ndarray, 'B T E'],  # output
+          Tuple[
+              jt.Float[jax.Array | np.ndarray, 'B T_src N D'],  # key cache
+              jt.Float[jax.Array | np.ndarray, 'B T_src N D'],
+          ],
+      ],  # value cache
+  ]:
     """Forward pass through the attention block.
 
     Args:
@@ -1036,7 +1176,9 @@ class InducedSelfAttentionBlock(nnx.Module):
       src: jt.Float[jax.Array | np.ndarray, 'B T E'],
       train_size: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
       *,
-      cached_inducing_repr: Optional[jt.Float[jax.Array | np.ndarray, 'B I E']] = None,
+      cached_inducing_repr: Optional[
+          jt.Float[jax.Array | np.ndarray, 'B I E']
+      ] = None,
       return_inducing_repr: bool = False,
   ) -> Union[Array, Tuple[Array, Array]]:
     """Helper to run the two-stage attention with static masking."""
@@ -1084,13 +1226,17 @@ class InducedSelfAttentionBlock(nnx.Module):
       src: jt.Float[jax.Array | np.ndarray, 'B T E'],
       train_size: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
       *,
-      cached_inducing_repr: Optional[jt.Float[jax.Array | np.ndarray, 'B I E']] = None,
+      cached_inducing_repr: Optional[
+          jt.Float[jax.Array | np.ndarray, 'B I E']
+      ] = None,
       return_inducing_repr: bool = False,
-  ) -> Union[jt.Float[jax.Array | np.ndarray, 'B T E'],
-             Tuple[jt.Float[jax.Array | np.ndarray, 'B T E'],   # output
-                   jt.Float[jax.Array | np.ndarray, 'B I E']    # cached_inducing_repr
-                  ]
-            ]:
+  ) -> Union[
+      jt.Float[jax.Array | np.ndarray, 'B T E'],
+      Tuple[
+          jt.Float[jax.Array | np.ndarray, 'B T E'],  # output
+          jt.Float[jax.Array | np.ndarray, 'B I E'],  # cached_inducing_repr
+      ],
+  ]:
     """Apply induced self-attention.
 
     Args:
@@ -1186,22 +1332,38 @@ class Encoder(Module):
   def __call__(
       self,
       src: jt.Float[jax.Array | np.ndarray, 'B T E'],
-      attn_mask: Optional[jt.Bool[jax.Array | np.ndarray, 'B #N #T T_prefill']] = None,
+      attn_mask: Optional[
+          jt.Bool[jax.Array | np.ndarray, 'B #N #T T_prefill']
+      ] = None,
       *,
       cached_kv: (
-          jt.Float[jax.Array | np.ndarray, 'Y B T_prefill E'] |         # For cache_icl_input_only
-          Tuple[jt.Float[jax.Array | np.ndarray, 'Y B T_prefill N D'],    # Key cache
-                jt.Float[jax.Array | np.ndarray, 'Y B T_prefill N D']] |  # Value cache
-          None
-      )=None,
+          jt.Float[
+              jax.Array | np.ndarray, 'Y B T_prefill E'
+          ]  # For cache_icl_input_only
+          | Tuple[
+              jt.Float[
+                  jax.Array | np.ndarray, 'Y B T_prefill N D'
+              ],  # Key cache
+              jt.Float[jax.Array | np.ndarray, 'Y B T_prefill N D'],
+          ]  # Value cache
+          | None
+      ) = None,
       return_kv: bool = False,
-  ) -> (jt.Float[jax.Array | np.ndarray, 'B T E'] |
-        Tuple[
-          jt.Float[jax.Array | np.ndarray, 'B T E'],            # Output
-          jt.Float[jax.Array | np.ndarray, 'Y B T_prefill E'] |         # For cache_icl_input_only
-          Tuple[jt.Float[jax.Array | np.ndarray, 'Y B T_prefill N D'],    # Key cache
-                jt.Float[jax.Array | np.ndarray, 'Y B T_prefill N D']]    # Value cache
-        ]):
+  ) -> (
+      jt.Float[jax.Array | np.ndarray, 'B T E']
+      | Tuple[
+          jt.Float[jax.Array | np.ndarray, 'B T E'],  # Output
+          jt.Float[
+              jax.Array | np.ndarray, 'Y B T_prefill E'
+          ]  # For cache_icl_input_only
+          | Tuple[
+              jt.Float[
+                  jax.Array | np.ndarray, 'Y B T_prefill N D'
+              ],  # Key cache
+              jt.Float[jax.Array | np.ndarray, 'Y B T_prefill N D'],
+          ],  # Value cache
+      ]
+  ):
     """Forward pass through the stacked encoder blocks.
 
     Args:
@@ -1250,7 +1412,9 @@ class Encoder(Module):
         )
         @nnx.remat
         def scan_fn_cached(
-            block: MultiheadAttentionBlock, carry: jax.Array | np.ndarray, layer_kv
+            block: MultiheadAttentionBlock,
+            carry: jax.Array | np.ndarray,
+            layer_kv,
         ):
           out = block(
               q=carry,
@@ -1291,12 +1455,15 @@ class Encoder(Module):
         final_out, kvs = scan_fn_return_input(self.blocks, src)
         return final_out, kvs
       else:
+
         @nnx.scan(
             in_axes=(0, nnx.Carry),  # block, carry
             out_axes=(nnx.Carry, 0),  # carry, layer_kv
         )
         @nnx.remat
-        def scan_fn_return_kv(block: MultiheadAttentionBlock, carry: jax.Array | np.ndarray):
+        def scan_fn_return_kv(
+            block: MultiheadAttentionBlock, carry: jax.Array | np.ndarray
+        ):
           out, new_kv = block(
               q=carry,
               k=carry,
@@ -1369,6 +1536,7 @@ class SetTransformer(Module):
       raise ValueError(f'Activation must be one of {list(activations.keys())}')
 
     act_fn = activations[activation]
+
     @nnx.split_rngs(splits=num_blocks)
     @nnx.vmap(axis_size=num_blocks)
     def create_block(rngs):
@@ -1393,15 +1561,20 @@ class SetTransformer(Module):
       src: jt.Float[jax.Array | np.ndarray, 'B T E'],
       train_size: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
       *,
-      cached_inducing_repr: Optional[jt.Float[jax.Array | np.ndarray, 'Y B I E']] = None,
+      cached_inducing_repr: Optional[
+          jt.Float[jax.Array | np.ndarray, 'Y B I E']
+      ] = None,
       return_inducing_repr: bool = False,
-  ) -> Union[jt.Float[jax.Array | np.ndarray, 'B T E'],    # Output
-             # For cached_inducing_repr:
-             Tuple[
-                 # Output
-                 jt.Float[jax.Array | np.ndarray, 'B T E'],
-                 # Cache
-                 jt.Float[jax.Array | np.ndarray, 'Y B I E']]]:
+  ) -> Union[
+      jt.Float[jax.Array | np.ndarray, 'B T E'],  # Output
+      # For cached_inducing_repr:
+      Tuple[
+          # Output
+          jt.Float[jax.Array | np.ndarray, 'B T E'],
+          # Cache
+          jt.Float[jax.Array | np.ndarray, 'Y B I E'],
+      ],
+  ]:
     """Applies the Set Transformer to the input.
 
     Args:
@@ -1426,7 +1599,9 @@ class SetTransformer(Module):
       )
       @nnx.remat
       def scan_fn_cached(
-          block: InducedSelfAttentionBlock, carry: jax.Array | np.ndarray, layer_repr
+          block: InducedSelfAttentionBlock,
+          carry: jax.Array | np.ndarray,
+          layer_repr,
       ):
         out = block(
             carry,
@@ -1445,7 +1620,9 @@ class SetTransformer(Module):
           out_axes=(nnx.Carry, 0),
       )
       @nnx.remat
-      def scan_fn_return(block: InducedSelfAttentionBlock, carry: jax.Array | np.ndarray):
+      def scan_fn_return(
+          block: InducedSelfAttentionBlock, carry: jax.Array | np.ndarray
+      ):
         out, repr = block(
             carry,
             train_size=train_size,
@@ -1463,10 +1640,10 @@ class SetTransformer(Module):
           out_axes=nnx.Carry,
       )
       @nnx.remat
-      def scan_fn(block: InducedSelfAttentionBlock, carry: jax.Array | np.ndarray):
-        out = block(
-            carry, train_size=train_size
-        )
+      def scan_fn(
+          block: InducedSelfAttentionBlock, carry: jax.Array | np.ndarray
+      ):
+        out = block(carry, train_size=train_size)
         return out
 
       final_out = scan_fn(self.blocks, src)
@@ -1635,7 +1812,7 @@ class CellEmbedder(nnx.Module):
   def feature_grouping(
       self,
       X: jt.Shaped[jax.Array | np.ndarray, 'B T H'],
-      d: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None
+      d: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
   ) -> jt.Shaped[jax.Array | np.ndarray, 'B T H G']:
     """Groups features with overlap using shifts.
 
@@ -1703,7 +1880,9 @@ class CellEmbedder(nnx.Module):
       # features_expanded shape: (B, T, HC, in_dim)
       # fourier_frequencies shape: (in_dim, num_frequencies)
       x_proj = jnp.einsum(
-          '...i,if->...if', features_expanded_raw, self.fourier_frequencies.value
+          '...i,if->...if',
+          features_expanded_raw,
+          self.fourier_frequencies.value,
       )
       # Always keep fourier_feats in per-slot shape: (B, T, HC, G, num_freq*2).
       # When feature_group=False, feature_grouping returns (B, T, HC, 1), so G=1
@@ -1719,7 +1898,9 @@ class CellEmbedder(nnx.Module):
       if cat_mask is not None:
         # Group cat_mask exactly like features (X) were grouped.
         # Expand to (B, 1, HC) so feature_grouping sees shape (B, T, HC).
-        cat_mask_grouped = self.feature_grouping(cat_mask[:, None, :], d=d)  # (B, 1, HC, G)
+        cat_mask_grouped = self.feature_grouping(
+            cat_mask[:, None, :], d=d
+        )  # (B, 1, HC, G)
         # Broadcast to (B, 1, HC, G, 1) to match (B, T, HC, G, E)
         cat_mask_per_slot = cat_mask_grouped[:, :, :, :, None]
 
@@ -1757,7 +1938,9 @@ class CellEmbedder(nnx.Module):
         # TODO: Try using Fourier features for the continuous y embedding (as
         # done for X in feature_grouping) instead of a plain MLP, so the model
         # gets the same frequency-rich representation for target values.
-        y_embedded: Float[Array, '... T E'] = self.y_embedder_lookup(y[..., None])
+        y_embedded: Float[Array, '... T E'] = self.y_embedder_lookup(
+            y[..., None]
+        )
 
       if train_size is not None:
         # Create a mask for the training samples.
@@ -1867,12 +2050,17 @@ class ColEmbedding(nnx.Module):
       train_size: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
       feature_shuffles: Optional[List[List[int]]] = None,
       *,
-      cached_repr: Optional[jt.Float[jax.Array | np.ndarray, 'Y B*H I E']] = None,
+      cached_repr: Optional[
+          jt.Float[jax.Array | np.ndarray, 'Y B*H I E']
+      ] = None,
       return_repr: bool = False,
-  ) -> Union[jt.Float[jax.Array | np.ndarray, 'B T H E'],  # Output
-             Tuple[jt.Float[jax.Array | np.ndarray, 'B T H E'], # Output
-                   jt.Float[jax.Array | np.ndarray, 'Y B*H I E']  # cached_repr
-                  ]]:
+  ) -> Union[
+      jt.Float[jax.Array | np.ndarray, 'B T H E'],  # Output
+      Tuple[
+          jt.Float[jax.Array | np.ndarray, 'B T H E'],  # Output
+          jt.Float[jax.Array | np.ndarray, 'Y B*H I E'],  # cached_repr
+      ],
+  ]:
     """Transform input table into embeddings.
 
     Args:
@@ -1885,15 +2073,15 @@ class ColEmbedding(nnx.Module):
     Returns:
       Embeddings or (embeddings, new_repr).
     """
-    assert not (cached_repr is not None and return_repr), (
-        'Cannot have both cached_repr not None and return_repr set to True.'
-    )
+    assert not (
+        cached_repr is not None and return_repr
+    ), 'Cannot have both cached_repr not None and return_repr set to True.'
     B, T, HC, E = X.shape
     padded_train_size = T
     if cached_repr is not None:
-      assert train_size is None, (
-          'train_size must be None when cached_repr is not None.'
-      )
+      assert (
+          train_size is None
+      ), 'train_size must be None when cached_repr is not None.'
 
     assert padded_train_size is not None
     train_size_expanded = None
@@ -1913,7 +2101,7 @@ class ColEmbedding(nnx.Module):
     new_repr: Optional[Array] = None
 
     tf_col_st = typing.cast(SetTransformer, self.tf_col)
-    if cached_repr is not None:    # Decode.
+    if cached_repr is not None:  # Decode.
       representations = typing.cast(
           Array,
           tf_col_st(
@@ -1923,13 +2111,13 @@ class ColEmbedding(nnx.Module):
               cached_inducing_repr=cached_repr,
           ),
       )
-    elif return_repr:             # Prefill.
+    elif return_repr:  # Prefill.
       representations, new_repr = tf_col_st(
           src,
           train_size=train_size_expanded,
           return_inducing_repr=True,
       )
-    else:                        # Train.
+    else:  # Train.
       representations = typing.cast(
           Array,
           tf_col_st(
@@ -1952,7 +2140,9 @@ class ColEmbedding(nnx.Module):
       return final_embeddings, typing.cast(Array, new_repr)
     return final_embeddings
 
+
 # Row-wise embedding
+
 
 class RowInteraction(nnx.Module):
   """Context-aware row-wise interaction, rewritten in Flax NNX.
@@ -2008,8 +2198,10 @@ class RowInteraction(nnx.Module):
       self,
       embeddings: jt.Float[jax.Array | np.ndarray, 'B T H E'],
       d: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
-  ) -> (jt.Float[jax.Array | np.ndarray, 'B T H E']
-        | jt.Float[jax.Array | np.ndarray, 'B T C_TIMES_E']): # if output_full_sequence is False.
+  ) -> (
+      jt.Float[jax.Array | np.ndarray, 'B T H E']
+      | jt.Float[jax.Array | np.ndarray, 'B T C_TIMES_E']
+  ):  # if output_full_sequence is False.
     """Captures interactions between features within each row.
 
     Args:
@@ -2061,7 +2253,9 @@ class RowInteraction(nnx.Module):
 @nnx.dataclass
 class ICLearningCache:
   layer_caches: (
-      jt.Float[jax.Array | np.ndarray, 'Y B T_prefill E']  # For cache_icl_input_only
+      jt.Float[
+          jax.Array | np.ndarray, 'Y B T_prefill E'
+      ]  # For cache_icl_input_only
       | Tuple[
           jt.Float[jax.Array | np.ndarray, 'Y B T_prefill N D'],  # Key cache
           jt.Float[jax.Array | np.ndarray, 'Y B T_prefill N D'],  # Value cache
@@ -2095,6 +2289,7 @@ class ICLearning(nnx.Module):
   rngs : nnx.Rngs, optional
       RNGs for initialization.
   """
+
   @jt.typed
   def __init__(
       self,
@@ -2168,9 +2363,7 @@ class ICLearning(nnx.Module):
       )
 
   @jt.typed
-  def _prefill_sequence_length_from_cache(
-      self, cache: ICLearningCache
-  ) -> Any:
+  def _prefill_sequence_length_from_cache(self, cache: ICLearningCache) -> Any:
     """Returns the sequence length of the prefill cache."""
     assert cache.layer_caches is not None, 'Layer caches must be non-empty.'
     if self.cache_icl_input_only:
@@ -2190,11 +2383,15 @@ class ICLearning(nnx.Module):
       *,
       cache: Optional[ICLearningCache] = None,
       return_cache: bool = False,
-  ) -> (jt.Float[jax.Array | np.ndarray, 'B T K'] | jt.Float[jax.Array | np.ndarray, 'B T E']
-        | Tuple[
-            jt.Float[jax.Array | np.ndarray, 'B T K'] | jt.Float[jax.Array | np.ndarray, 'B T E'],
-            ICLearningCache
-          ]):
+  ) -> (
+      jt.Float[jax.Array | np.ndarray, 'B T K']
+      | jt.Float[jax.Array | np.ndarray, 'B T E']
+      | Tuple[
+          jt.Float[jax.Array | np.ndarray, 'B T K']
+          | jt.Float[jax.Array | np.ndarray, 'B T E'],
+          ICLearningCache,
+      ]
+  ):
     """Forward pass for ICLearning."""
     is_prefill = return_cache
     is_decode = cache is not None
@@ -2216,9 +2413,7 @@ class ICLearning(nnx.Module):
       assert train_size is not None
       if train_size.ndim == 2:
         train_size = jnp.squeeze(train_size, axis=-1)
-      train_mask = (
-          jnp.arange(sequence_length)[None, :] < train_size[:, None]
-      )
+      train_mask = jnp.arange(sequence_length)[None, :] < train_size[:, None]
       full_attn_mask = train_mask[:, None, None, :]
       y_encoded = y_encoded * train_mask.reshape(B, sequence_length, 1)
       R = R + y_encoded
@@ -2227,7 +2422,8 @@ class ICLearning(nnx.Module):
       prefill_train_size = cache.prefill_train_size
       prefill_sequence_length = self._prefill_sequence_length_from_cache(cache)
       train_mask = (
-          jnp.arange(prefill_sequence_length)[None, :] < prefill_train_size[:, None]
+          jnp.arange(prefill_sequence_length)[None, :]
+          < prefill_train_size[:, None]
       )
       full_attn_mask = train_mask[:, None, None, :]
 
@@ -2239,8 +2435,7 @@ class ICLearning(nnx.Module):
           R, attn_mask=full_attn_mask, return_kv=True
       )
       new_cache = ICLearningCache(
-          layer_caches=new_layer_caches,
-          prefill_train_size=train_size
+          layer_caches=new_layer_caches, prefill_train_size=train_size
       )
     else:
       assert is_decode
@@ -2249,8 +2444,6 @@ class ICLearning(nnx.Module):
           R, attn_mask=full_attn_mask, cached_kv=cache.layer_caches
       )
 
-
-
     result = self.ln(result)
     result = self.decoder(result)
     if return_cache:
@@ -2258,7 +2451,9 @@ class ICLearning(nnx.Module):
       return result, new_cache
     return result
 
+
 # TabFM
+
 
 class TabFM(nnx.Module):
   """A Tabular Foundation Model (TabFM), rewritten in Flax NNX.
@@ -2484,13 +2679,22 @@ class TabFM(nnx.Module):
       self,
       X: jt.Float[jax.Array | np.ndarray, 'B T H'],
       y: jt.Shaped[Array, 'B T'],
-      train_size: jt.Int[jax.Array | np.ndarray, 'B'] | jt.Int[jax.Array | np.ndarray, 'B 1'],
-      d: jt.Int[jax.Array | np.ndarray, 'B'] | jt.Int[jax.Array | np.ndarray, 'B 1'] | None = None,
+      train_size: (
+          jt.Int[jax.Array | np.ndarray, 'B']
+          | jt.Int[jax.Array | np.ndarray, 'B 1']
+      ),
+      d: (
+          jt.Int[jax.Array | np.ndarray, 'B']
+          | jt.Int[jax.Array | np.ndarray, 'B 1']
+          | None
+      ) = None,
       cat_mask: Optional[jt.Bool[jax.Array | np.ndarray, 'B H']] = None,
       softmax_temperature: float = 0.9,
       num_classes: Optional[int] = None,
-  ) -> (jt.Float[jax.Array | np.ndarray, 'B T E']      # Regression
-        | jt.Float[jax.Array | np.ndarray, 'B T K']):  # Classification
+  ) -> (
+      jt.Float[jax.Array | np.ndarray, 'B T E']  # Regression
+      | jt.Float[jax.Array | np.ndarray, 'B T K']
+  ):  # Classification
     """Processes tabular data through nested encoders and ICL predictor.
 
     Args:
@@ -2523,7 +2727,6 @@ class TabFM(nnx.Module):
         X, y, train_size=train_size, d=d, cat_mask=cat_mask
     )  # (B, T, HC, E)
 
-
     # Column-wise embedding
     embeddings = typing.cast(
         Array,
@@ -2538,15 +2741,12 @@ class TabFM(nnx.Module):
         self.cls_tokens[...], (B1, T1, self.row_num_cls, self.embed_dim)
     )
 
-    embeddings = jnp.concatenate(
-        [cls_tokens_expanded, embeddings], axis=-2
-    )
+    embeddings = jnp.concatenate([cls_tokens_expanded, embeddings], axis=-2)
 
     embeddings = self.row_interactor(
         embeddings,
         d=d,
     )
-
 
     embeddings = typing.cast(
         Array,
@@ -2586,10 +2786,13 @@ class TabFM(nnx.Module):
       y: jt.Shaped[jax.Array | np.ndarray, 'B T'],
       d: jt.Int[jax.Array | np.ndarray, 'B'] = None,
       cat_mask: jt.Bool[jax.Array | np.ndarray, 'B H'] | None = None,
-  ) -> (
-      Tuple[(jt.Float[jax.Array | np.ndarray, 'B T K'] | jt.Float[jax.Array | np.ndarray, 'B T E']),
-             Dict[str, Any] # cache
-      ]):
+  ) -> Tuple[
+      (
+          jt.Float[jax.Array | np.ndarray, 'B T K']
+          | jt.Float[jax.Array | np.ndarray, 'B T E']
+      ),
+      Dict[str, Any],  # cache
+  ]:
     """Prefills the model with training data and returns the cache.
 
     Args:
@@ -2629,7 +2832,6 @@ class TabFM(nnx.Module):
         X, y, train_size=train_size, d=d, cat_mask=cat_mask
     )
 
-
     # Stage 1: Column-wise embedding
     res = typing.cast(
         Tuple[jnp.ndarray, Array],
@@ -2641,7 +2843,6 @@ class TabFM(nnx.Module):
     )
     embeddings, cache_col1 = res
 
-
     # Prepend CLS tokens to embeddings before row interactor
     B1, T1, _, _ = embeddings.shape
     cls_tokens_expanded = jnp.broadcast_to(
@@ -2649,9 +2850,7 @@ class TabFM(nnx.Module):
     )
     embeddings = jnp.concatenate([cls_tokens_expanded, embeddings], axis=-2)
 
-    embeddings = self.row_interactor(
-        embeddings, d=d
-    )
+    embeddings = self.row_interactor(embeddings, d=d)
 
     res2 = typing.cast(
         Tuple[jnp.ndarray, Array],
@@ -2663,9 +2862,7 @@ class TabFM(nnx.Module):
     )
     embeddings, cache_col2 = res2
 
-    representations = self.row_interactor_2(
-        embeddings, d=d
-    )
+    representations = self.row_interactor_2(embeddings, d=d)
 
     # Stage 3: ICL
     logits_icl, cache_icl = self.icl_predictor(
@@ -2692,7 +2889,10 @@ class TabFM(nnx.Module):
       cat_mask: Optional[jt.Bool[jax.Array | np.ndarray, 'B H']] = None,
       softmax_temperature: float = 0.9,
       num_classes: Optional[int] = None,
-  ) -> (jt.Float[jax.Array | np.ndarray, 'B T K'] | jt.Float[jax.Array | np.ndarray, 'B T E']):
+  ) -> (
+      jt.Float[jax.Array | np.ndarray, 'B T K']
+      | jt.Float[jax.Array | np.ndarray, 'B T E']
+  ):
     """Generates predictions for test data using cached KVs.
 
     Args:
@@ -2722,13 +2922,13 @@ class TabFM(nnx.Module):
 
     # Stage 0: Cell-wise embedding for test rows
     cell_embeddings = self.cell_embedder(
-        X, y,
+        X,
+        y,
         # train_size is 0 for the current batch (all are test rows relative to the cache)
-        train_size=jnp.zeros((B,),
-                             dtype=jnp.int32),
-        d=d, cat_mask=cat_mask
+        train_size=jnp.zeros((B,), dtype=jnp.int32),
+        d=d,
+        cat_mask=cat_mask,
     )
-
 
     # Stage 1: Column-wise embedding with cache
     embeddings = typing.cast(
@@ -2740,7 +2940,6 @@ class TabFM(nnx.Module):
         ),
     )
 
-
     # Prepend CLS tokens
     B1, T1, _, _ = embeddings.shape
     cls_tokens_expanded = jnp.broadcast_to(
@@ -2748,9 +2947,7 @@ class TabFM(nnx.Module):
     )
     embeddings = jnp.concatenate([cls_tokens_expanded, embeddings], axis=-2)
 
-    embeddings = self.row_interactor(
-        embeddings, d=d
-    )
+    embeddings = self.row_interactor(embeddings, d=d)
 
     embeddings = typing.cast(
         Array,
@@ -2762,9 +2959,7 @@ class TabFM(nnx.Module):
     )
 
     # Stage 2: Row-wise interaction
-    representations = self.row_interactor_2(
-        embeddings, d=d
-    )
+    representations = self.row_interactor_2(embeddings, d=d)
 
     # Stage 3: ICL with cache
     out = self.icl_predictor(

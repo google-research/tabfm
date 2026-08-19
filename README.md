@@ -147,6 +147,37 @@ print("Predicted Prices:", predictions)
 
 ---
 
+## Multi-GPU inference (PyTorch)
+
+TabFM reads the whole training fold as one in-context sequence, so very large
+contexts (roughly >450k rows on an 80GB GPU) exceed a single device's memory.
+`tabfm.src.pytorch.seqpar` shards the rows of the sequence across the ranks of
+a `torch.distributed` process group with mathematically exact attention (no
+approximation; results match the single-device path up to bf16 summation
+order). Launch one process per GPU, e.g. with `torchrun`:
+
+```python
+import torch.distributed as dist
+from tabfm import TabFMRegressor, tabfm_v1_0_0_pytorch
+from tabfm.src.pytorch import seqpar
+
+dist.init_process_group("nccl")
+model = tabfm_v1_0_0_pytorch.load(model_type="regression", device=f"cuda:{rank}")
+reg = TabFMRegressor(model=model, n_estimators=1)
+reg.fit(X_train, y_train)          # cheap: no GPU forward
+preds = seqpar.predict(reg, X_test)  # collective call; every rank returns preds
+```
+
+`seqpar.predict_proba` is the classification equivalent. A runnable script is
+provided in [examples/seqpar_regression_example.py](examples/seqpar_regression_example.py).
+
+The JAX backend has an equivalent, `tabfm.src.jax.seqpar`: a single process
+shards the rows across all local devices with `jax.shard_map`, with the same
+`seqpar.predict(reg, X_test)` / `seqpar.predict_proba(clf, X_test)` API (no
+`torchrun` needed). A 1M-row context fits
+in ~35GB/GPU on 4 devices (a single 80GB device cannot run it at all), and at
+single-device-feasible sizes the sharded path is ~5x faster on 4 GPUs.
+
 ## Examples Directory
 
 You can find runnable scripts for both classification and regression under the [examples/](examples/) folder:
