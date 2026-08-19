@@ -2616,7 +2616,6 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     y_fit = None
     if needs_validation:
       oof_probs, val_idx = self._predict_oof_proba(cv=self.num_folds_for_cv)
-      val_idx = getattr(self, "oof_val_indices_", None)
       if val_idx is not None:
         oof_probs_fit = oof_probs[:, val_idx, :]
         y_orig_fit = y_orig[val_idx]
