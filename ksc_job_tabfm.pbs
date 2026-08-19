@@ -1,29 +1,108 @@
 #!/bin/bash
-#PBS -N tabfm_train
-#PBS -q cas_v100_2                  # qstat -Q 확인됨 (2026-08-13). 단일 GPU면 충분한 규모 -- 필요시 amd_a100_4로 교체
-#PBS -l select=1:ncpus=4:ngpus=1    # TODO: qstat -Qf cas_v100_2 로 노드당 ncpus/ngpus 비율, 최대 walltime 확인 후 조정
-#PBS -l walltime=24:00:00
+# =============================================================================
+# TabFM — KSC(PBS) 제출 스크립트 (conda 버전)
+#
+# 사전 준비 (로그인 노드에서 1회, KSC_SETUP.md 참고):
+#   # 1) conda 확보 — 아래 둘 중 하나
+#   module load conda/pytorch_2.9.1_cuda12          # (A) KSC 모듈
+#   # 또는
+#   source /scratch/$USER/miniforge3/etc/profile.d/conda.sh   # (B) 직접 설치
+#
+#   # 2) 환경 생성 (home 쿼터가 작으므로 반드시 scratch 에 -p 로)
+#   conda create -p /scratch/$USER/envs/tabfm python=3.11 -y
+#   conda activate /scratch/$USER/envs/tabfm
+#   python -V        # <- 3.11.x 인지 반드시 확인하고 다음으로
+#
+#   # 3) 설치 + 가중치 캐시 미리 받기
+#   export PYTHONNOUSERSITE=1
+#   export HF_HOME=/scratch/$USER/hf_cache
+#   cd /scratch/$USER/ksc-models/tabfm
+#   pip install -U pip && pip install -e ".[jax,cuda]"
+#   python examples/classification_example.py
+#     -> 계산 노드는 외부 네트워크가 없을 수 있으므로 반드시 로그인 노드에서 먼저 실행
+#
+# *** 기존 설치 실패의 원인 (2026-08-13 확인) ***
+#   로그인 노드에는 conda 가 기본 PATH 에 없다. `conda create` 가 조용히 실패한
+#   상태에서 pip 를 돌리면 시스템 python3.9 로 설치가 진행되고,
+#   tabfm 은 python>=3.11 을 요구하므로
+#     ERROR: No matching distribution found for flax>=0.12.7
+#   로 끝난다. flax 문제가 아니라 파이썬 버전 문제다.
+#   -> 아래 4) 단계에서 파이썬 버전을 강제로 검사한다.
+#
+# 검증 상태: jax 0.11.0 + CudaDevice 2개 인식 확인 (glogin01, 2026-08-13)
+# =============================================================================
+#PBS -N tabfm_smoketest
+#PBS -q cas_v100_2
+#PBS -l select=1:ncpus=4:ngpus=1
+#PBS -l walltime=00:30:00
 #PBS -j oe
-#PBS -o tabfm_train.log
+#PBS -o tabfm_smoketest.log
+
+# 계정 지정이 필요한 경우 아래 주석 해제 후 본인 값 입력
+##PBS -A etc
 
 set -euo pipefail
 cd "$PBS_O_WORKDIR"
 
-# 1) CUDA 모듈 로드 (버전은 KSC에서 `module avail cuda`로 확인 후 맞출 것)
-module load cuda/12.1
+# --- 사용자별로 바꿀 값 (다른 사람이 재사용할 때 여기 3줄만 수정) ------------
+# (A) KSC 모듈의 conda 를 쓸 경우: 아래 CONDA_SH 를 비워두고 CONDA_MODULE 지정
+# (B) 직접 설치한 miniforge 를 쓸 경우: CONDA_SH 에 conda.sh 경로 지정
+CONDA_SH="${CONDA_SH:-/scratch/$USER/miniforge3/etc/profile.d/conda.sh}"
+CONDA_MODULE="${CONDA_MODULE:-}"          # 예: conda/pytorch_2.9.1_cuda12
+ENV_PREFIX="${ENV_PREFIX:-/scratch/$USER/envs/tabfm}"
+HF_CACHE="${HF_CACHE:-/scratch/$USER/hf_cache}"
+# ---------------------------------------------------------------------------
 
-# 2) conda 환경 활성화
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate tabfm
+# 1) conda 활성화
+#    (jax[cuda12] 휠은 CUDA/cuDNN 런타임을 nvidia-*-cu12 패키지로 자체 번들하므로
+#     `module load cuda/...` 는 하지 않는다. 시스템 CUDA 와 섞이면 오히려 위험.)
+if [ -n "$CONDA_MODULE" ]; then
+  module load "$CONDA_MODULE"
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+elif [ -f "$CONDA_SH" ]; then
+  source "$CONDA_SH"
+else
+  echo "!!! conda 를 찾을 수 없습니다. CONDA_SH 또는 CONDA_MODULE 을 설정하세요." >&2
+  exit 1
+fi
 
-# 3) 로컬 검증용 environment.yml은 CPU jax를 깔았음 -> GPU용으로 교체
-#    (이미 tabfm env에 GPU jax가 설치돼 있다면 아래 줄은 건너뛰어도 됨)
-pip install -U "jax[cuda12]"
+conda activate "$ENV_PREFIX"
 
-# 4) GPU 인식 확인 (로그에 GpuDevice가 안 보이면 여기서 멈추고 CUDA/jax 버전 조합을 다시 볼 것)
-python -c "import jax; print('JAX devices:', jax.devices())"
+# 2) ~/.local 의 시스템 python3.9 패키지가 끼어드는 것을 차단
+export PYTHONNOUSERSITE=1
 
-# 5) 실제 학습/파인튜닝 명령 (README의 실제 학습 스크립트로 교체)
-#    아래는 로컬에서 검증된 최소 스모크 테스트 예시 -- 실제 job에서는
-#    README에 있는 fine-tuning/inference 진입점으로 바꿀 것.
-PYTHONPATH=. python3 -m unittest tabfm.src.classifier_and_regressor_test -v
+# 3) HuggingFace 캐시를 scratch 로 (home 쿼터 절약 + 재다운로드 방지)
+export HF_HOME="${HF_CACHE}"
+
+# 4) 환경 검증 — 잘못된 파이썬으로 24시간을 날리지 않기 위한 가드
+python - <<'PY'
+import sys
+v = sys.version_info
+print("python", sys.version.split()[0], "|", sys.executable)
+if v < (3, 11):
+    sys.exit(f"!!! python {v.major}.{v.minor} 입니다. tabfm 은 3.11 이상이 필요합니다. "
+             "conda 환경이 제대로 활성화됐는지 확인하세요.")
+PY
+
+python -c "import jax; print('jax', jax.__version__); print('devices:', jax.devices())"
+nvidia-smi --query-gpu=name,memory.total --format=csv || true
+
+# 5) GPU 가 안 보이면 중단 (CPU로 조용히 도는 사고 방지)
+python - <<'PY'
+import sys, jax
+if not any(d.platform == "gpu" for d in jax.devices()):
+    sys.exit("!!! GPU가 보이지 않습니다. jax[cuda12] 설치와 노드 할당을 확인하세요.")
+print("GPU 확인 완료")
+PY
+
+# 6) 스모크 테스트 — 실제 사전학습 모델 로드 + fit/predict
+python examples/classification_example.py
+python examples/regression_example.py
+
+# 7) 단위 테스트
+PYTHONPATH=. python -m unittest tabfm.src.classifier_and_regressor_test -v
+
+# --- 실제 작업으로 바꿀 때 --------------------------------------------------
+# 위 6)/7) 을 본인의 학습·평가 스크립트로 교체하고 walltime 을 늘린다
+# (이 큐의 상한은 48:00:00). 대용량 벤치마크는 examples/tabarena_*_example.py 참고.
+# ---------------------------------------------------------------------------
