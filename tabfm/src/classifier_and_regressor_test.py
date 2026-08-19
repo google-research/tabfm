@@ -798,6 +798,98 @@ class CalibrationTest(absltest.TestCase):
         self.assertEqual(probs.shape, (150, 3))
 
 
+class ClassifierOOFValidationIndexTest(absltest.TestCase):
+
+  def test_fit_uses_returned_validation_indices_for_nnls_and_calibration(self):
+    classifier = TabFMClassifier(
+        model=mock.Mock(max_classes=2),
+        n_estimators=2,
+        norm_methods=["none"],
+        enable_nnls=True,
+        nnls_beta=1.0,
+        binary_calibration_method="platt",
+        average_logits=False,
+    )
+    X = np.arange(18, dtype=float).reshape(6, 3)
+    y = np.array([0, 0, 1, 1, 1, 0])
+    val_idx = np.array([4, 1, 5])
+    oof_probs = np.zeros((2, 6, 2))
+    oof_probs[:, val_idx, :] = np.array([
+        [[0.8, 0.2], [0.3, 0.7], [0.6, 0.4]],
+        [[0.4, 0.6], [0.1, 0.9], [0.7, 0.3]],
+    ])
+    nnls_weights = np.array([0.75, 0.25])
+
+    with mock.patch.object(
+        classifier,
+        "_predict_oof_proba",
+        return_value=(oof_probs, val_idx),
+    ):
+      with mock.patch(
+          "tabfm.src.classifier_and_regressor.opt.nnls",
+          return_value=(nnls_weights, 0.0),
+      ) as mock_nnls:
+        with mock.patch.object(
+            classifier, "_fit_calibration"
+        ) as mock_fit_calibration:
+          classifier.fit(X, y)
+
+    selected_oof_probs = oof_probs[:, val_idx, :]
+    nnls_inputs, nnls_targets = mock_nnls.call_args.args
+    np.testing.assert_allclose(nnls_inputs, selected_oof_probs.reshape(2, -1).T)
+    np.testing.assert_array_equal(nnls_targets, np.eye(2)[y[val_idx]].ravel())
+
+    calibration_probs, calibration_targets = mock_fit_calibration.call_args.args
+    np.testing.assert_allclose(
+        calibration_probs,
+        np.tensordot(nnls_weights, selected_oof_probs, axes=(0, 0)),
+    )
+    np.testing.assert_array_equal(calibration_targets, y[val_idx])
+
+  def test_fit_uses_all_oof_rows_when_validation_indices_are_none(self):
+    classifier = TabFMClassifier(
+        model=mock.Mock(max_classes=2),
+        n_estimators=2,
+        norm_methods=["none"],
+        binary_calibration_method="platt",
+        average_logits=False,
+    )
+    X = np.arange(18, dtype=float).reshape(6, 3)
+    y = np.array([0, 1, 0, 1, 1, 0])
+    oof_probs = np.array([
+        [
+            [0.8, 0.2],
+            [0.3, 0.7],
+            [0.6, 0.4],
+            [0.2, 0.8],
+            [0.1, 0.9],
+            [0.7, 0.3],
+        ],
+        [
+            [0.4, 0.6],
+            [0.1, 0.9],
+            [0.7, 0.3],
+            [0.5, 0.5],
+            [0.3, 0.7],
+            [0.9, 0.1],
+        ],
+    ])
+
+    with mock.patch.object(
+        classifier,
+        "_predict_oof_proba",
+        return_value=(oof_probs, None),
+    ):
+      with mock.patch.object(
+          classifier, "_fit_calibration"
+      ) as mock_fit_calibration:
+        classifier.fit(X, y)
+
+    calibration_probs, calibration_targets = mock_fit_calibration.call_args.args
+    np.testing.assert_allclose(calibration_probs, np.mean(oof_probs, axis=0))
+    np.testing.assert_array_equal(calibration_targets, y)
+
+
 @unittest.skipUnless(HAS_JAX, "JAX is required")
 class StackingTest(absltest.TestCase):
 
@@ -966,6 +1058,7 @@ class StackingTest(absltest.TestCase):
         n_estimators=1,
         enable_nnls=True,
         average_logits=False,
+        binary_calibration_method="platt",
         min_rows_for_single_val_split=2,
         num_folds_for_cv=5,
     )
@@ -975,11 +1068,18 @@ class StackingTest(absltest.TestCase):
     with mock.patch.object(
         classifier, "_batch_forward", return_value=np.zeros((1, 2, 2))
     ) as mock_forward:
-      classifier.fit(X, y)
+      with mock.patch.object(
+          classifier, "_fit_calibration"
+      ) as mock_fit_calibration:
+        classifier.fit(X, y)
 
     # With 10 rows and 5 folds, val fold size is 2.
     # It should therefore only run 1 fold instead of 5.
     self.assertEqual(mock_forward.call_count, 1)
+    calibration_probs, calibration_targets = mock_fit_calibration.call_args.args
+    self.assertEqual(calibration_probs.shape, (2, 2))
+    self.assertEqual(calibration_targets.shape, (2,))
+    np.testing.assert_allclose(np.sum(calibration_probs, axis=1), 1.0)
 
   def test_min_rows_for_single_val_split_regressor(self):
     regressor = TabFMRegressor(
@@ -1019,6 +1119,7 @@ class StackingTest(absltest.TestCase):
         max_num_rows=5000,
         enable_nnls=True,
         average_logits=False,
+        binary_calibration_method="platt",
         num_folds_for_cv=5,
     )
     X = np.random.rand(10000, 3)
@@ -1029,11 +1130,18 @@ class StackingTest(absltest.TestCase):
     with mock.patch.object(
         classifier, "_batch_forward", return_value=np.zeros((2, 1000, 2))
     ) as mock_forward:
-      classifier.fit(X, y)
+      with mock.patch.object(
+          classifier, "_fit_calibration"
+      ) as mock_fit_calibration:
+        classifier.fit(X, y)
 
     self.assertIsNotNone(classifier.ensemble_generator_.holdout_indices_)
     self.assertLen(classifier.ensemble_generator_.holdout_indices_, 1000)
     self.assertEqual(mock_forward.call_count, 1)
+    calibration_probs, calibration_targets = mock_fit_calibration.call_args.args
+    self.assertEqual(calibration_probs.shape, (1000, 2))
+    self.assertEqual(calibration_targets.shape, (1000,))
+    np.testing.assert_allclose(np.sum(calibration_probs, axis=1), 1.0)
 
   def test_max_num_rows_with_enable_nnls_regressor(self):
     regressor = TabFMRegressor(
