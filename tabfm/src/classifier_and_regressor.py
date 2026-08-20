@@ -2167,9 +2167,10 @@ def _build_context_cache_pytorch(
         Xs_split, ys_split, cat_masks_split, ds_split
     ):
       X_t = torch.from_numpy(X_batch).to(device, dtype=torch.float32)
-      y_t = torch.from_numpy(y_batch).to(device)
+      y_t = torch.from_numpy(y_batch)
       if y_t.dtype == torch.float64:
         y_t = y_t.to(torch.float32)
+      y_t = y_t.to(device)
       cat_mask_t = torch.from_numpy(cat_mask_batch).to(device)
       d_t = torch.from_numpy(ds_batch).to(device)
       _, cache = model.prefill(X_t, y_t, cat_mask=cat_mask_t, d=d_t)
