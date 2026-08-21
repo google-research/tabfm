@@ -47,6 +47,8 @@
 #SBATCH --output=tabfm_smoketest.log
 #SBATCH --error=tabfm_smoketest.log
 #SBATCH --comment="field=chem;appl=jax"
+#SBATCH --mail-user=hsy071322@naver.com
+#SBATCH --mail-type=END,FAIL
 
 # ↓ qsub가 "Account" 관련 에러로 거부되면 아래 주석을 풀고 본인 계정값 채울 것.
 ##SBATCH --account=etc
