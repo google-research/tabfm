@@ -1,6 +1,10 @@
 #!/bin/bash
 # =============================================================================
-# TabFM — KSC(PBS) 제출 스크립트 (conda 버전)
+# TabFM — KSC(Slurm) 제출 스크립트 (conda 버전)
+#
+# 이 시스템(KISTI Neuron)은 순수 Slurm이다. `qsub`는 sbatch를 그대로 호출만
+# 하고 `#PBS` 지시어는 해석하지 않으므로(그냥 주석으로 무시됨) `#SBATCH`로 쓴다.
+# (showappl 확인, 2026-08-21: --comment="field=<field>;appl=<program>" 필수)
 #
 # 사전 준비 (로그인 노드에서 1회, KSC_SETUP.md 참고):
 #   # 1) conda 확보 — 아래 둘 중 하나
@@ -30,19 +34,25 @@
 #   -> 아래 4) 단계에서 파이썬 버전을 강제로 검사한다.
 #
 # 검증 상태: jax 0.11.0 + CudaDevice 2개 인식 확인 (glogin01, 2026-08-13)
+# 검증 상태: classification_example.py 로컬 CPU 환경(Python 3.11.15, jax 0.10.2)에서
+#   HuggingFace 134개 파일 다운로드 + 컴파일 + 예측까지 end-to-end 성공 (2026-08-21)
 # =============================================================================
-#PBS -N tabfm_smoketest
-#PBS -q cas_v100_2
-#PBS -l select=1:ncpus=4:ngpus=1
-#PBS -l walltime=00:30:00
-#PBS -j oe
-#PBS -o tabfm_smoketest.log
+#SBATCH --job-name=tabfm_smoketest
+#SBATCH --partition=cas_v100_2
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --gres=gpu:1
+#SBATCH --time=00:30:00
+#SBATCH --output=tabfm_smoketest.log
+#SBATCH --error=tabfm_smoketest.log
+#SBATCH --comment="field=chem;appl=jax"
 
-# 계정 지정이 필요한 경우 아래 주석 해제 후 본인 값 입력
-##PBS -A etc
+# ↓ qsub가 "Account" 관련 에러로 거부되면 아래 주석을 풀고 본인 계정값 채울 것.
+##SBATCH --account=etc
 
 set -euo pipefail
-cd "$PBS_O_WORKDIR"
+cd "$SLURM_SUBMIT_DIR"
 
 # --- 사용자별로 바꿀 값 (다른 사람이 재사용할 때 여기 3줄만 수정) ------------
 # (A) KSC 모듈의 conda 를 쓸 경우: 아래 CONDA_SH 를 비워두고 CONDA_MODULE 지정
@@ -104,5 +114,5 @@ PYTHONPATH=. python -m unittest tabfm.src.classifier_and_regressor_test -v
 
 # --- 실제 작업으로 바꿀 때 --------------------------------------------------
 # 위 6)/7) 을 본인의 학습·평가 스크립트로 교체하고 walltime 을 늘린다
-# (이 큐의 상한은 48:00:00). 대용량 벤치마크는 examples/tabarena_*_example.py 참고.
+# (이 partition의 상한은 48:00:00). 대용량 벤치마크는 examples/tabarena_*_example.py 참고.
 # ---------------------------------------------------------------------------
