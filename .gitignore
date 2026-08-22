@@ -29,3 +29,9 @@ docs/_build
 docs/api
 .venv/
 
+# KSC 잡 실행 산물
+*.pbs.o*
+*.pbs.e*
+*_pretrain.log
+*_smoketest.log
+
