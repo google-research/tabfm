@@ -56,13 +56,13 @@
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 
-# --- 사용자별로 바꿀 값 (다른 사람이 재사용할 때 여기 3줄만 수정) ------------
-# (A) KSC 모듈의 conda 를 쓸 경우: 아래 CONDA_SH 를 비워두고 CONDA_MODULE 지정 (기본값)
-# (B) 직접 설치한 miniforge 를 쓸 경우: CONDA_MODULE 을 비우고 CONDA_SH 에 conda.sh 경로 지정
-#    *** 계산 노드에는 conda가 기본 PATH에 없다 (smoke test 확인, 2026-08-22).
-#    KSC 모듈(conda/pytorch_2.9.1_cuda12)이 실제로 존재하는 걸 확인했으므로 기본값으로 씀.
-CONDA_SH="${CONDA_SH:-/scratch/$USER/miniforge3/etc/profile.d/conda.sh}"
-CONDA_MODULE="${CONDA_MODULE:-conda/pytorch_2.9.1_cuda12}"
+# --- 사용자별로 바꿀 값 (다른 사람이 재사용할 때 여기 2줄만 수정) ------------
+#    *** `module load conda/pytorch_2.9.1_cuda12`는 conda 도구 자체가 아니라
+#    미리 만들어진 특정 환경의 bin/만 PATH에 얹어준다 -- conda 명령이 없다
+#    (2026-08-22 실제 확인: "conda: command not found"). conda 명령은
+#    /apps/applications/Miniconda/<버전>/bin/conda 에 실제로 존재하므로
+#    그 base를 직접 source 한다 (module load 불필요).
+CONDA_BASE="${CONDA_BASE:-/apps/applications/Miniconda/25.11.1}"
 ENV_PREFIX="${ENV_PREFIX:-/scratch/$USER/envs/tabfm}"
 HF_CACHE="${HF_CACHE:-/scratch/$USER/hf_cache}"
 # ---------------------------------------------------------------------------
@@ -70,13 +70,10 @@ HF_CACHE="${HF_CACHE:-/scratch/$USER/hf_cache}"
 # 1) conda 활성화
 #    (jax[cuda12] 휠은 CUDA/cuDNN 런타임을 nvidia-*-cu12 패키지로 자체 번들하므로
 #     `module load cuda/...` 는 하지 않는다. 시스템 CUDA 와 섞이면 오히려 위험.)
-if [ -n "$CONDA_MODULE" ]; then
-  module load "$CONDA_MODULE"
-  source "$(conda info --base)/etc/profile.d/conda.sh"
-elif [ -f "$CONDA_SH" ]; then
-  source "$CONDA_SH"
+if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+  source "$CONDA_BASE/etc/profile.d/conda.sh"
 else
-  echo "!!! conda 를 찾을 수 없습니다. CONDA_SH 또는 CONDA_MODULE 을 설정하세요." >&2
+  echo "!!! $CONDA_BASE 에 conda가 없습니다. CONDA_BASE 를 실제 Miniconda 설치 경로로 맞춰주세요." >&2
   exit 1
 fi
 
