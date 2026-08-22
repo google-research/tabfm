@@ -57,10 +57,12 @@ set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 
 # --- 사용자별로 바꿀 값 (다른 사람이 재사용할 때 여기 3줄만 수정) ------------
-# (A) KSC 모듈의 conda 를 쓸 경우: 아래 CONDA_SH 를 비워두고 CONDA_MODULE 지정
-# (B) 직접 설치한 miniforge 를 쓸 경우: CONDA_SH 에 conda.sh 경로 지정
+# (A) KSC 모듈의 conda 를 쓸 경우: 아래 CONDA_SH 를 비워두고 CONDA_MODULE 지정 (기본값)
+# (B) 직접 설치한 miniforge 를 쓸 경우: CONDA_MODULE 을 비우고 CONDA_SH 에 conda.sh 경로 지정
+#    *** 계산 노드에는 conda가 기본 PATH에 없다 (smoke test 확인, 2026-08-22).
+#    KSC 모듈(conda/pytorch_2.9.1_cuda12)이 실제로 존재하는 걸 확인했으므로 기본값으로 씀.
 CONDA_SH="${CONDA_SH:-/scratch/$USER/miniforge3/etc/profile.d/conda.sh}"
-CONDA_MODULE="${CONDA_MODULE:-}"          # 예: conda/pytorch_2.9.1_cuda12
+CONDA_MODULE="${CONDA_MODULE:-conda/pytorch_2.9.1_cuda12}"
 ENV_PREFIX="${ENV_PREFIX:-/scratch/$USER/envs/tabfm}"
 HF_CACHE="${HF_CACHE:-/scratch/$USER/hf_cache}"
 # ---------------------------------------------------------------------------
