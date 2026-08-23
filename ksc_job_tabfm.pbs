@@ -77,13 +77,26 @@ else
   exit 1
 fi
 
+# conda의 activate.d 훅이 set -u에 안전하지 않은 경우가 있어
+# (2026-08-22 MolE에서 MKL_INTERFACE_LAYER: unbound variable 확인)
+# activate 호출 구간만 방어적으로 set -u 해제.
+set +u
 conda activate "$ENV_PREFIX"
+set -u
 
 # 2) ~/.local 의 시스템 python3.9 패키지가 끼어드는 것을 차단
 export PYTHONNOUSERSITE=1
 
 # 3) HuggingFace 캐시를 scratch 로 (home 쿼터 절약 + 재다운로드 방지)
 export HF_HOME="${HF_CACHE}"
+
+# 3-1) V100 16GB에서 orbax 체크포인트 복원 중 OOM 발생
+# (2026-08-23 실제 확인, job 890313: RESOURCE_EXHAUSTED: Out of memory
+# while trying to allocate 1.50GiB). JAX가 기본적으로 GPU 메모리의 상당
+# 부분을 미리 통째로 preallocate해서 단편화(fragmentation)를 유발하므로,
+# 에러 로그가 직접 제안한 cuda_malloc_async 할당자로 전환 + preallocate 끔.
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export TF_GPU_ALLOCATOR=cuda_malloc_async
 
 # 4) 환경 검증 — 잘못된 파이썬으로 24시간을 날리지 않기 위한 가드
 python - <<'PY'
