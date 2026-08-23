@@ -97,6 +97,9 @@ export HF_HOME="${HF_CACHE}"
 # 에러 로그가 직접 제안한 cuda_malloc_async 할당자로 전환 + preallocate 끔.
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export TF_GPU_ALLOCATOR=cuda_malloc_async
+#    *** 위 두 옵션으로도 OOM이 재발하면 모델 자체가 V100 16GB에 안 맞는 것이니,
+#    #SBATCH --partition=cas_v100_2 를 amd_a100_4 로 바꿔서 더 큰 GPU 메모리로
+#    재시도할 것 (이 클러스터에 확인된 대체 파티션, 2026-08-13).
 
 # 4) 환경 검증 — 잘못된 파이썬으로 24시간을 날리지 않기 위한 가드
 python - <<'PY'
