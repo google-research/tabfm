@@ -68,7 +68,10 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     "token",
     None,
-    "Hugging Face write token. Required if repo_id is provided.",
+    "Hugging Face write token. Prefer the HF_TOKEN environment variable or "
+    "`hf auth login`: a token passed on the command line is visible to other "
+    "users on the machine through the process list. Required if repo_id is "
+    "provided and neither of those is set.",
 )
 flags.DEFINE_string(
     "checkpoint_path",
@@ -188,11 +191,19 @@ def main(argv):
     local_dirs[mtype] = saved_dir
     
   if FLAGS.repo_id:
-    if not FLAGS.token:
-      raise ValueError("Hugging Face token is required when repo_id is provided.")
+    from huggingface_hub import HfApi, get_token  # pylint: disable=g-import-not-at-top
 
-    from huggingface_hub import HfApi  # pylint: disable=g-import-not-at-top
-    api = HfApi(token=FLAGS.token)
+    # get_token() reads HF_TOKEN and then the token saved by `hf auth login`,
+    # so the credential does not have to be passed in argv, where it stays
+    # visible to every other user on the machine for the life of the upload.
+    token = FLAGS.token or get_token()
+    if not token:
+      raise ValueError(
+          "Hugging Face token is required when repo_id is provided. Set "
+          "HF_TOKEN, run `hf auth login`, or pass --token."
+      )
+
+    api = HfApi(token=token)
 
     for mtype, sdir in local_dirs.items():
       logging.info("Uploading %s folder to %s...", mtype, FLAGS.repo_id)
