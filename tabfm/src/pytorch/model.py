@@ -151,6 +151,21 @@ class MultiheadAttention(nn.Module):
     new_k, new_v = k, v  # cache format: [B, T_src, N, D], pre-transpose.
 
     q, k, v = (z.transpose(1, 2) for z in (q, k, v))  # [B,N,T,D]
+    # A boolean [B,1,1,T_src] prefix key-padding mask ("the first n keys are
+    # valid", the same n for every query and batch element) is equivalent to
+    # truncating k/v to those n keys and passing no mask. Dropping the mask
+    # lets SDPA dispatch to the flash/memory-efficient backends, whose memory
+    # is linear in sequence length; any non-null attn_mask forces the math
+    # backend, which materializes the [T_q, T_src] score matrix per head and
+    # OOMs at large context sizes. Any other mask falls through unchanged.
+    if (attn_mask is not None and attn_mask.dtype == torch.bool
+        and attn_mask.dim() == 4 and attn_mask.shape[1] == 1
+        and attn_mask.shape[2] == 1 and attn_mask.shape[3] == k.shape[2]):
+      key_valid = attn_mask[:, 0, 0, :]
+      n = int(key_valid[0].sum())
+      if (n > 0 and bool((key_valid.sum(1) == n).all())
+          and bool(key_valid[:, :n].all())):
+        k, v, attn_mask = k[:, :, :n], v[:, :, :n], None
     # bf16 SDPA (flash already does the softmax in float32 internally).
     o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=1.0)
     out = self.out_proj(o.transpose(1, 2).reshape(b, tq, d))
