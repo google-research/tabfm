@@ -175,7 +175,7 @@ TabFM uses in-context learning over a bounded context window, so very large
 tables should be sampled or split before inference. The scikit-learn estimators
 expose the main practical limits through `max_num_features` and `max_num_rows`
 (defaults are 500 features and 100 context rows), plus `n_estimators` for
-ensembling over multiple sampled contexts and `inference_batch_size` for memory
+ensembling over multiple sampled contexts and `batch_size` for memory
 control. If your dataset is larger than these limits, TabFM will work with the
 sampled/context rows rather than consuming the full table at once.
 
