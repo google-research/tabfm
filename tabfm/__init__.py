@@ -28,6 +28,7 @@ except ImportError:
   pass
 
 from tabfm.src.classifier_and_regressor import TabFMClassifier, TabFMRegressor
+from tabfm.src.generation import TabFMDataGenerator
 
 # A new PyPI release will be pushed every time `__version__` is increased.
 # When changing this, also update the CHANGELOG.md.

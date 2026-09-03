@@ -36,6 +36,7 @@ _has_jax = importlib.util.find_spec("jax") is not None
 collect_ignore = []
 if not _has_torch:
   collect_ignore.append("tabfm/src/classifier_and_regressor_pytorch_test.py")
+  collect_ignore.append("tabfm/src/generation_pytorch_test.py")
 if not _has_jax:
   collect_ignore += [
       "tabfm/src/jax/model_test.py",
