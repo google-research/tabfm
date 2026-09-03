@@ -22,13 +22,16 @@ fine resolution despite the model's max_classes limit via hierarchical
 quantile refinement: the column is split into n_bins ** n_levels equal-mass
 bins and the bin index is sampled digit by digit in base n_bins, with the
 already-sampled digits appended to the conditioning features. A value is then
-drawn uniformly within the sampled bin, so the per-column conditionals form a
-piecewise-uniform density. Only the classification model is used; the
-regression head emits a point estimate and is never needed here.
+drawn uniformly within the sampled bin, except that a value repeated in the
+reference data is reproduced exactly with its share of the bin, so the
+per-column conditionals form a piecewise-uniform density with point masses.
+Missing values are sampled as a per-row presence flag before the value itself.
+Only the classification model is used; the regression head emits a point
+estimate and is never needed here.
 """
 
 import dataclasses
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -92,15 +95,49 @@ def bin_values(
 
 
 @jt.typed
+def bin_atoms(
+    values: jt.Float[np.ndarray, "N"],
+    bin_ids: jt.Int[np.ndarray, "N"],
+    n_bins: int,
+) -> Tuple[jt.Float[np.ndarray, "B"], jt.Float[np.ndarray, "B"]]:
+  """Per bin, the most frequent value and its share of the bin's rows.
+
+  A value counts as an atom only when it occurs at least twice in its bin;
+  other bins get NaN with share 0.
+  """
+  counts = (
+      pd.DataFrame({"b": bin_ids, "v": values})
+      .value_counts(sort=False)
+      .reset_index(name="n")
+      .sort_values("n", ascending=False, kind="stable")
+      .drop_duplicates("b")
+  )
+  counts = counts[counts["n"] >= 2]
+  atom_value = np.full(n_bins, np.nan)
+  atom_frac = np.zeros(n_bins)
+  b = counts["b"].to_numpy()
+  sizes = np.bincount(bin_ids, minlength=n_bins)
+  atom_value[b] = counts["v"].to_numpy()
+  atom_frac[b] = counts["n"].to_numpy() / sizes[b]
+  return atom_value, atom_frac
+
+
+@jt.typed
 def sample_within_bins(
     bin_ids: jt.Int[np.ndarray, "N"],
     edges: jt.Float[np.ndarray, "E"],
     rng: np.random.Generator,
+    atom_value: Optional[jt.Float[np.ndarray, "B"]] = None,
+    atom_frac: Optional[jt.Float[np.ndarray, "B"]] = None,
 ) -> jt.Float[np.ndarray, "N"]:
-  """Draws uniformly inside each row's bin."""
+  """Draws uniformly inside each row's bin, or the bin's atom with its share."""
   lo = edges[bin_ids]
   hi = edges[bin_ids + 1]
-  return lo + rng.random(len(bin_ids)) * (hi - lo)
+  out = lo + rng.random(len(bin_ids)) * (hi - lo)
+  if atom_value is not None:
+    hit = rng.random(len(bin_ids)) < atom_frac[bin_ids]
+    out[hit] = atom_value[bin_ids[hit]]
+  return out
 
 
 @jt.typed
@@ -136,7 +173,7 @@ def indices_from_digits(
 class ColumnSpec:
   """Per-column sampling strategy decided at fit() time."""
 
-  name: str
+  name: Any
   kind: str  # "constant" | "categorical" | "numeric"
   dtype: Any
   values: np.ndarray  # NaN-free reference values for this column
@@ -144,6 +181,8 @@ class ColumnSpec:
   edges: Optional[np.ndarray] = None  # numeric: fine quantile bin edges
   base: Optional[int] = None  # numeric: classes per refinement level
   n_digits: Optional[int] = None  # numeric: refinement levels
+  atom_value: Optional[np.ndarray] = None  # numeric: repeated value per bin
+  atom_frac: Optional[np.ndarray] = None  # numeric: its share of the bin
   other: Optional[np.ndarray] = None  # categorical: merged tail classes
   other_freqs: Optional[np.ndarray] = None  # empirical freqs of the tail
 
@@ -155,11 +194,13 @@ class TabFMDataGenerator:
     X_: Reference DataFrame stored at fit() time.
     feature_names_: Column names of the reference data, in original order.
     columns_: Fitted per-column ``ColumnSpec`` strategies.
+    rng_: Random stream shared by successive ``sample()`` calls.
   """
 
   X_: pd.DataFrame
-  feature_names_: List[str]
+  feature_names_: List[Any]
   columns_: List[ColumnSpec]
+  rng_: np.random.Generator
 
   def __init__(
       self,
@@ -213,9 +254,12 @@ class TabFMDataGenerator:
     self.X_ = X
     self.feature_names_ = list(X.columns)
     self.columns_ = []
+    self.rng_ = np.random.default_rng(self.random_state)
     for name in self.feature_names_:
       values = X[name].dropna().to_numpy()
-      uniques, counts = np.unique(values, return_counts=True)
+      value_counts = pd.Series(values).value_counts(sort=False)
+      uniques = value_counts.index.to_numpy()
+      counts = value_counts.to_numpy()
       dtype = X[name].dtype
       # Everything non-numeric (object, string, category, ...) plus bool is
       # sampled as categorical; numeric columns may still fold into the
@@ -233,7 +277,7 @@ class TabFMDataGenerator:
           # More classes than the model supports: model the most frequent
           # ones directly and merge the tail into one class that is
           # re-sampled from its empirical frequencies when drawn.
-          order = np.argsort(counts)[::-1]
+          order = np.argsort(-counts, kind="stable")
           top, tail = order[: max_classes - 1], order[max_classes - 1 :]
           tail_counts = counts[tail].astype(float)
           spec = ColumnSpec(name=name, kind="categorical", dtype=dtype,
@@ -241,14 +285,18 @@ class TabFMDataGenerator:
                             other=uniques[tail],
                             other_freqs=tail_counts / tail_counts.sum())
       else:
-        edges = quantile_edges(values.astype(float), n_bins ** self.n_levels)
+        fvalues = values.astype(float)
+        edges = quantile_edges(fvalues, n_bins ** self.n_levels)
         n_fine = len(edges) - 1
         # Digits needed to index the fine bins in base n_bins; duplicate
         # quantiles on skewed data may shrink n_fine below the full power.
         n_digits = max(1, int(np.ceil(np.log(n_fine) / np.log(n_bins))))
+        atom_value, atom_frac = bin_atoms(
+            fvalues, bin_values(fvalues, edges), n_fine)
         spec = ColumnSpec(name=name, kind="numeric", dtype=dtype,
                           values=values, edges=edges, base=n_bins,
-                          n_digits=n_digits)
+                          n_digits=n_digits, atom_value=atom_value,
+                          atom_frac=atom_frac)
       self.columns_.append(spec)
     return self
 
@@ -264,12 +312,16 @@ class TabFMDataGenerator:
     and sampled via the chain rule: the first non-constant column from its
     empirical marginal, each later column from a TabFM classifier conditioned
     on the columns already sampled. Constant columns never join the
-    conditioning set.
+    conditioning set. Columns with missing values in the reference data first
+    draw a per-row presence flag the same way, and absent rows stay NaN.
+    Successive calls continue the random stream seeded at ``fit()`` time, so
+    they return different rows; call ``fit()`` again to restart it.
 
     Args:
       n_samples: Number of synthetic rows to generate.
-      t: Sampling temperature; < 1 concentrates near the modes of the
-        reference data, > 1 flattens the sampled distributions.
+      t: Sampling temperature, a finite positive number; < 1 concentrates
+        near the modes of the reference data, > 1 flattens the sampled
+        distributions.
       column_order: Optional explicit visitation order; must be a permutation
         of the fitted column names.
 
@@ -281,6 +333,9 @@ class TabFMDataGenerator:
       raise ValueError(
           "This TabFMDataGenerator is not fitted yet; call fit(X) first."
       )
+    t = float(t)
+    if not (np.isfinite(t) and t > 0):
+      raise ValueError(f"t must be a finite positive number, got {t!r}.")
     if column_order is not None and sorted(column_order) != sorted(
         self.feature_names_
     ):
@@ -288,7 +343,7 @@ class TabFMDataGenerator:
           "column_order must be a permutation of the fitted columns "
           f"{self.feature_names_}, got {column_order}."
       )
-    rng = np.random.default_rng(self.random_state)
+    rng = self.rng_
     specs = {s.name: s for s in self.columns_}
     if column_order is not None:
       order = list(column_order)
@@ -300,10 +355,19 @@ class TabFMDataGenerator:
     conditioning = []
     for name in order:
       spec = specs[name]
-      if spec.kind == "constant" or not conditioning:
-        col = self._sample_marginal(spec, n_samples, t, rng)
-      else:
-        col = self._sample_conditional(spec, synth[conditioning], t, rng)
+      x_cond = None
+      if conditioning and spec.kind != "constant":
+        x_cond = synth[conditioning]
+      present = self._sample_present(spec, x_cond, n_samples, t, rng)
+      col = np.full(n_samples, np.nan,
+                    dtype=float if spec.kind == "numeric" else object)
+      if present.any():
+        if x_cond is None:
+          col[present] = self._sample_marginal(
+              spec, int(present.sum()), t, rng)
+        else:
+          col[present] = self._sample_conditional(
+              spec, x_cond[present], t, rng)
       if spec.kind == "numeric" and pd.api.types.is_integer_dtype(spec.dtype):
         col = np.round(col)
       synth[name] = col
@@ -333,6 +397,27 @@ class TabFMDataGenerator:
       out[~top] = rng.choice(spec.other, size=n_other, p=spec.other_freqs)
     return out
 
+  def _sample_present(
+      self,
+      spec: ColumnSpec,
+      x_cond_synth: Optional[pd.DataFrame],
+      n_samples: int,
+      t: float,
+      rng: np.random.Generator,
+  ) -> np.ndarray:
+    """Draws which synthetic rows receive a value rather than NaN."""
+    present_ref = self.X_[spec.name].notna().to_numpy()
+    if present_ref.all():
+      return np.ones(n_samples, dtype=bool)
+    if x_cond_synth is None or not present_ref.any():
+      p = float(present_ref.mean())
+      p = temperature_scale(np.array([[1.0 - p, p]]), t)[0, 1]
+      return rng.random(n_samples) < p
+    x_cond_ref = self.X_[list(x_cond_synth.columns)]
+    drawn = self._classify_and_sample(
+        x_cond_ref, present_ref.astype(np.int64), x_cond_synth, t, rng)
+    return drawn.astype(bool)
+
   def _sample_marginal(
       self, spec: ColumnSpec, n_samples: int, t: float,
       rng: np.random.Generator
@@ -351,7 +436,8 @@ class TabFMDataGenerator:
     counts = np.bincount(ids, minlength=len(spec.edges) - 1).astype(float)
     probs = temperature_scale((counts / counts.sum())[None, :], t)[0]
     drawn = rng.choice(len(probs), size=n_samples, p=probs)
-    return sample_within_bins(drawn, spec.edges, rng)
+    return sample_within_bins(drawn, spec.edges, rng, spec.atom_value,
+                              spec.atom_frac)
 
   def _classify_and_sample(
       self,
@@ -367,8 +453,12 @@ class TabFMDataGenerator:
         n_estimators=self.n_estimators,
         random_state=int(rng.integers(2**31 - 1)),
     )
-    clf.fit(x_ref, y_train)
-    probs = np.asarray(clf.predict_proba(x_synth)).astype(np.float64)
+    # sklearn rejects a mix of string and non-string feature names, which
+    # arises once digit columns join integer-labelled reference columns.
+    names = [str(c) for c in x_ref.columns]
+    clf.fit(x_ref.set_axis(names, axis=1), y_train)
+    probs = clf.predict_proba(x_synth.set_axis(names, axis=1))
+    probs = np.asarray(probs).astype(np.float64)
     probs = probs[:, : len(clf.classes_)]
     probs = probs / probs.sum(axis=-1, keepdims=True)
     probs = temperature_scale(probs, t)
@@ -422,4 +512,5 @@ class TabFMDataGenerator:
     # Digit combinations past the last bin can only arise when duplicate
     # quantiles shrank the bin count below a full power of base; clamp them.
     drawn_ids = np.minimum(drawn_ids, len(spec.edges) - 2)
-    return sample_within_bins(drawn_ids, spec.edges, rng)
+    return sample_within_bins(drawn_ids, spec.edges, rng, spec.atom_value,
+                              spec.atom_frac)

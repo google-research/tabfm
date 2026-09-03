@@ -31,7 +31,8 @@ To release a new version (e.g. from `1.0.0` -> `2.0.0`):
   columns use hierarchical quantile refinement (the fine-bin index is sampled
   digit by digit, `n_bins ** n_levels` effective bins — 100 by default);
   sampling is temperature-controlled with seeded or user-supplied column
-  orders.
+  orders. Repeated values (point masses) and missing values in the reference
+  data are reproduced.
 
 ## [1.0.1] - 2026-07-09
 

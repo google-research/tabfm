@@ -97,6 +97,34 @@ class TabFMDataGeneratorEndToEndTest(unittest.TestCase):
     out = gen.sample(6)
     self.assertTrue(pd.api.types.is_integer_dtype(out["count"]))
 
+  def test_numpy_input_with_conditional_numeric_column(self):
+    rng = np.random.default_rng(0)
+    X = np.c_[rng.normal(size=24), rng.integers(0, 2, size=24)]
+    gen = TabFMDataGenerator(model=_tiny_model(), n_estimators=2,
+                             random_state=0).fit(X)
+    out = gen.sample(4, column_order=[1, 0])
+    self.assertEqual(list(out.columns), [0, 1])
+    self.assertEqual(len(out), 4)
+
+  def test_missing_values_in_conditioned_columns(self):
+    rng = np.random.default_rng(0)
+    n = 40
+    num = rng.normal(size=n)
+    num[::3] = np.nan
+    cat = np.where(rng.random(n) < 0.5, "a", "b").astype(object)
+    cat[1::5] = None
+    df = pd.DataFrame({"num": num, "cat": cat, "num2": rng.normal(size=n)})
+    gen = TabFMDataGenerator(model=_tiny_model(), n_estimators=2,
+                             random_state=0).fit(df)
+    # A high temperature flattens the presence classifier, so both columns
+    # get NaN rows whatever the untrained model outputs.
+    out = gen.sample(30, t=100.0, column_order=["num2", "num", "cat"])
+    self.assertFalse(out["num2"].isna().any())
+    self.assertTrue(out["num"].isna().any())
+    self.assertTrue(out["cat"].isna().any())
+    self.assertTrue(set(out["cat"].dropna()) <= {"a", "b"})
+    self.assertEqual(list(out.dtypes), list(df.dtypes))
+
   def test_sample_before_fit_raises(self):
     gen = TabFMDataGenerator(model=_tiny_model())
     with self.assertRaises(ValueError):

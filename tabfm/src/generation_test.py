@@ -24,6 +24,7 @@ try:
   HAS_JAX = True
 except ImportError:
   HAS_JAX = False
+from tabfm.src.generation import bin_atoms
 from tabfm.src.generation import bin_values
 from tabfm.src.generation import digits_of
 from tabfm.src.generation import indices_from_digits
@@ -102,6 +103,27 @@ class SamplingPrimitivesTest(absltest.TestCase):
     vals = sample_within_bins(ids, edges, rng)
     self.assertTrue(np.all(vals[0::2] >= 0.0) and np.all(vals[0::2] <= 1.0))
     self.assertTrue(np.all(vals[1::2] >= 1.0) and np.all(vals[1::2] <= 10.0))
+
+  def test_bin_atoms_flags_repeated_values_only(self):
+    values = np.array([0.0, 0.0, 0.0, 0.5, 1.5, 2.5])
+    ids = np.array([0, 0, 0, 0, 1, 1])
+    atom_value, atom_frac = bin_atoms(values, ids, n_bins=3)
+    self.assertEqual(atom_value[0], 0.0)
+    self.assertAlmostEqual(atom_frac[0], 0.75)
+    self.assertTrue(np.isnan(atom_value[1]))
+    self.assertEqual(atom_frac[1], 0.0)
+    self.assertTrue(np.isnan(atom_value[2]))  # empty bin
+    self.assertEqual(atom_frac[2], 0.0)
+
+  def test_sample_within_bins_returns_atoms_with_their_share(self):
+    rng = np.random.default_rng(0)
+    edges = np.array([0.0, 1.0, 10.0])
+    ids = np.array([0, 1] * 2000)
+    atom_value = np.array([0.0, np.nan])
+    atom_frac = np.array([0.6, 0.0])
+    vals = sample_within_bins(ids, edges, rng, atom_value, atom_frac)
+    self.assertAlmostEqual((vals[0::2] == 0.0).mean(), 0.6, delta=0.03)
+    self.assertTrue(np.all(vals[1::2] > 1.0) and np.all(vals[1::2] <= 10.0))
 
   def test_digit_round_trip(self):
     idx = np.arange(1000)
@@ -185,6 +207,22 @@ class FitColumnSpecTest(absltest.TestCase):
     self.assertLen(spec.other, 6)
     np.testing.assert_allclose(spec.other_freqs.sum(), 1.0)
 
+  def test_mixed_type_object_column_is_categorical(self):
+    df = pd.DataFrame({"mixed": ["a", 1, "b", 2] * 6,
+                       "num": np.linspace(0.0, 1.0, 24)})
+    spec = self._spec(self._fit(df), "mixed")
+    self.assertEqual(spec.kind, "categorical")
+    self.assertCountEqual(spec.categories.tolist(), ["a", 1, "b", 2])
+
+  def test_numeric_spec_records_point_masses(self):
+    df = pd.DataFrame({"spike": [0.0] * 60 + list(np.linspace(1.0, 2.0, 40)),
+                       "cat": ["a", "b"] * 50})
+    spec = self._spec(self._fit(df), "spike")
+    self.assertEqual(spec.kind, "numeric")
+    self.assertEqual(spec.atom_value[0], 0.0)
+    self.assertGreater(spec.atom_frac[0], 0.9)
+    self.assertEqual(np.count_nonzero(spec.atom_frac), 1)
+
   def test_nan_rows_excluded_from_values(self):
     df = pd.DataFrame({"num": [1.0, np.nan, 3.0, 4.0] * 10,
                        "cat": ["a", "b", "a", "b"] * 10})
@@ -225,6 +263,16 @@ class MarginalSamplingTest(absltest.TestCase):
     self.assertTrue(np.all(out >= -5.0) and np.all(out <= 5.0))
     self.assertGreater(len(np.unique(out)), 100)  # fresh values, not copies
 
+  def test_numeric_marginal_keeps_point_mass(self):
+    rng = np.random.default_rng(0)
+    spike = np.concatenate([np.zeros(150), rng.exponential(size=50)])
+    df = pd.DataFrame({"spike": spike, "cat": ["a", "b"] * 100})
+    gen = self._gen(df)
+    out = gen._sample_marginal(self._spec(gen, "spike"), 2000, 1.0,
+                               np.random.default_rng(0))
+    self.assertAlmostEqual((out == 0.0).mean(), 0.75, delta=0.04)
+    self.assertGreater(len(np.unique(out[out > 0])), 100)
+
   def test_encode_decode_round_trip_with_tail(self):
     labels = (["common%d" % i for i in range(9) for _ in range(10)]
               + ["rare%d" % i for i in range(6)])
@@ -247,6 +295,43 @@ class MarginalSamplingTest(absltest.TestCase):
     rng = np.random.default_rng(0)
     out = gen._sample_marginal(self._spec(gen, "cat"), 50, 1e-6, rng)
     self.assertTrue(np.all(out == "a"))
+
+
+class SampleWithoutModelTest(absltest.TestCase):
+  """sample() paths that need no model call: marginals and validation."""
+
+  def _gen(self, df):
+    return TabFMDataGenerator(model=_FakeModel(), random_state=0).fit(df)
+
+  def test_rejects_non_positive_or_non_finite_temperature(self):
+    gen = self._gen(pd.DataFrame({"num": np.linspace(0.0, 1.0, 20),
+                                  "const": [1.0] * 20}))
+    for t in (0.0, -1.0, float("nan"), float("inf")):
+      with self.assertRaises(ValueError):
+        gen.sample(4, t=t)
+
+  def test_missing_values_are_reproduced(self):
+    num = np.linspace(0.0, 1.0, 1000)
+    num[::4] = np.nan
+    gen = self._gen(pd.DataFrame({"num": num, "const": [1.0] * 1000}))
+    out = gen.sample(2000)
+    self.assertAlmostEqual(out["num"].isna().mean(), 0.25, delta=0.03)
+    self.assertFalse(out["const"].isna().any())
+
+  def test_all_nan_column_samples_nan(self):
+    gen = self._gen(pd.DataFrame({"empty": [np.nan] * 20,
+                                  "num": np.linspace(0.0, 1.0, 20)}))
+    out = gen.sample(5)
+    self.assertTrue(out["empty"].isna().all())
+    self.assertEqual(out["empty"].dtype, np.float64)
+    self.assertFalse(out["num"].isna().any())
+
+  def test_successive_calls_continue_the_random_stream(self):
+    df = pd.DataFrame({"num": np.linspace(0.0, 1.0, 50), "const": [1.0] * 50})
+    gen = self._gen(df)
+    first, second = gen.sample(10), gen.sample(10)
+    self.assertFalse(first.equals(second))
+    pd.testing.assert_frame_equal(self._gen(df).sample(10), first)
 
 
 @unittest.skipUnless(HAS_JAX, "JAX backend not installed")

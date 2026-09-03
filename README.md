@@ -142,7 +142,9 @@ distribution over columns with the chain rule and samples each column from a
 TabFM classifier's predictive distribution. Numerical columns are sampled at
 fine resolution via hierarchical quantile refinement (`n_bins ** n_levels`
 equal-mass bins — 100 by default, 1000 with `n_levels=3`), with the value
-drawn uniformly within the sampled bin.
+drawn uniformly within the sampled bin. Values that repeat in the reference
+data (for example the zeros of a zero-inflated column) are reproduced exactly,
+and missing values are sampled at their conditional rate.
 
 ```python
 import pandas as pd
