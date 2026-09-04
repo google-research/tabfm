@@ -704,6 +704,35 @@ class ModelTypeMismatchTest(absltest.TestCase):
       classifier._predict_oof_proba(cv=2)
 
 
+class SoftmaxTemperatureTest(absltest.TestCase):
+
+  def test_invalid_temperature_raises(self):
+    logits = np.array([[2.0, 1.0, 0.0]], dtype=np.float64)
+
+    for temperature in (0.0, -1.0, np.nan, np.inf, -np.inf):
+      with self.subTest(temperature=temperature):
+        with self.assertRaisesRegex(
+            ValueError, "temperature must be finite and greater than 0"
+        ):
+          TabFMClassifier.softmax(
+              logits, axis=-1, temperature=temperature
+          )
+
+  def test_positive_temperature_returns_valid_probabilities(self):
+    logits = np.array([[2.0, 1.0, 0.0]], dtype=np.float64)
+
+    probabilities = TabFMClassifier.softmax(
+        logits, axis=-1, temperature=0.9
+    )
+
+    self.assertTrue(np.all(np.isfinite(probabilities)))
+    np.testing.assert_allclose(
+        probabilities.sum(axis=-1),
+        np.ones(logits.shape[0]),
+    )
+    self.assertEqual(np.argmax(probabilities, axis=-1).item(), 0)
+
+
 @unittest.skipUnless(HAS_JAX, "JAX is required")
 class CalibrationTest(absltest.TestCase):
 
