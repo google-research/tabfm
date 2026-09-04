@@ -3370,11 +3370,11 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       Softmax probabilities with the same shape as ``x``.
 
     Raises:
-      ValueError: If ``temperature`` is not greater than zero.
+      ValueError: If ``temperature`` is not finite or is not greater than zero.
     """
-    if temperature <= 0:
+    if not np.isfinite(temperature) or temperature <= 0:
       raise ValueError(
-          f"temperature must be greater than 0. Got {temperature}."
+          f"temperature must be finite and greater than 0. Got {temperature}."
       )
 
     x = x / temperature

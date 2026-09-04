@@ -706,13 +706,13 @@ class ModelTypeMismatchTest(absltest.TestCase):
 
 class SoftmaxTemperatureTest(absltest.TestCase):
 
-  def test_non_positive_temperature_raises(self):
+  def test_invalid_temperature_raises(self):
     logits = np.array([[2.0, 1.0, 0.0]], dtype=np.float64)
 
-    for temperature in (0.0, -1.0):
+    for temperature in (0.0, -1.0, np.nan, np.inf, -np.inf):
       with self.subTest(temperature=temperature):
         with self.assertRaisesRegex(
-            ValueError, "temperature must be greater than 0"
+            ValueError, "temperature must be finite and greater than 0"
         ):
           TabFMClassifier.softmax(
               logits, axis=-1, temperature=temperature
