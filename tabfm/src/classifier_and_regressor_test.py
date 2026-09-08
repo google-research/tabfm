@@ -35,6 +35,24 @@ from tabfm.src.classifier_and_regressor import TransformToNumerical
 
 # pylint: disable=invalid-name
 
+
+class SoftmaxTest(absltest.TestCase):
+
+  def test_rejects_non_positive_temperature(self):
+    logits = np.array([[1.0, 2.0, 3.0]])
+
+    for temperature in (0.0, -1.0):
+      with self.assertRaisesRegex(ValueError, 'temperature must be greater than 0'):
+        TabFMClassifier.softmax(logits, temperature=temperature)
+
+  def test_positive_temperature_returns_probabilities(self):
+    logits = np.array([[1.0, 2.0, 3.0]])
+
+    probabilities = TabFMClassifier.softmax(logits, temperature=0.9)
+
+    np.testing.assert_allclose(probabilities.sum(axis=-1), 1.0)
+
+
 class EnsembleGeneratorTest(absltest.TestCase):
 
   def test_permute_categorical_structure(self):
