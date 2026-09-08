@@ -3370,6 +3370,9 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     Returns:
       Softmax probabilities with the same shape as ``x``.
     """
+    if temperature <= 0:
+      raise ValueError('temperature must be greater than 0')
+
     x = x / temperature
     # Subtract max for numerical stability
     x_max = np.max(x, axis=axis, keepdims=True)
