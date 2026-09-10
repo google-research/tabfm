@@ -42,9 +42,10 @@ def get_activation(name):
   # Activations are stored as module attributes (e.g. MLP.act), so they must be
   # picklable for AutoGluon/TabArena's pickle-based save. A module-level
   # function pickles by reference; a lambda would not.
-  return {"relu": F.relu,
-          "gelu": _gelu_tanh,
-          "silu": F.silu}[name]
+  activations = {"relu": F.relu, "gelu": _gelu_tanh, "silu": F.silu}
+  if name not in activations:
+    raise ValueError(f"Activation must be one of {list(activations.keys())}")
+  return activations[name]
 
 
 class RMSNorm(nn.Module):
@@ -83,6 +84,8 @@ class RoPE(nn.Module):
 
   def __init__(self, dim, base):
     super().__init__()
+    if dim < 2:
+      raise ValueError(f"dim must be at least 2. Got {dim}")
     inv = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))  # init = formula; overwritten on load
     self.register_buffer("freqs", inv)
 
@@ -99,6 +102,10 @@ class RoPE(nn.Module):
 class MultiheadAttention(nn.Module):
   def __init__(self, d_model, nhead, rope_base=None):
     super().__init__()
+    if d_model % nhead != 0:
+      raise ValueError(
+          f"d_model ({d_model}) must be divisible by nhead ({nhead})"
+      )
     self.nhead, self.hd = nhead, d_model // nhead
     self.rope_base = rope_base  # None => no RoPE
     self.q_proj = nn.Linear(d_model, d_model)
@@ -162,6 +169,10 @@ class MultiheadAttention(nn.Module):
 class MultiheadAttentionBlock(nn.Module):
   def __init__(self, d_model, nhead, dim_ff, activation="swiglu", rope_base=None):
     super().__init__()
+    if activation not in ("relu", "gelu", "swiglu"):
+      raise ValueError(
+          "Activation must be one of ['relu', 'gelu', 'swiglu']"
+      )
     self.attn = MultiheadAttention(d_model, nhead, rope_base)
     self.pre_attn_ln = RMSNorm(d_model)
     self.post_attn_ln = RMSNorm(d_model)
