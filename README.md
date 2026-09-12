@@ -16,21 +16,21 @@ To install TabFM, clone the repository and install it locally with the backend o
 ```bash
 git clone https://github.com/google-research/tabfm.git
 cd tabfm
-pip install -e .[jax]
+pip install -e ".[jax]"
 ```
 
 **JAX (GPU):**
 ```bash
 git clone https://github.com/google-research/tabfm.git
 cd tabfm
-pip install -e .[jax,cuda]
+pip install -e ".[jax,cuda]"
 ```
 
 **PyTorch (CPU/GPU):**
 ```bash
 git clone https://github.com/google-research/tabfm.git
 cd tabfm
-pip install -e .[pytorch]
+pip install -e ".[pytorch]"
 ```
 *Note: For PyTorch with GPU support, ensure you have the appropriate PyTorch version installed for your CUDA version before installing TabFM.*
 
