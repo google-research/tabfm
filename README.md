@@ -16,21 +16,21 @@ To install TabFM, clone the repository and install it locally with the backend o
 ```bash
 git clone https://github.com/google-research/tabfm.git
 cd tabfm
-pip install -e .[jax]
+pip install -e ".[jax]"
 ```
 
 **JAX (GPU):**
 ```bash
 git clone https://github.com/google-research/tabfm.git
 cd tabfm
-pip install -e .[jax,cuda]
+pip install -e ".[jax,cuda]"
 ```
 
 **PyTorch (CPU/GPU):**
 ```bash
 git clone https://github.com/google-research/tabfm.git
 cd tabfm
-pip install -e .[pytorch]
+pip install -e ".[pytorch]"
 ```
 *Note: For PyTorch with GPU support, ensure you have the appropriate PyTorch version installed for your CUDA version before installing TabFM.*
 
@@ -81,6 +81,14 @@ model = tabfm_v1_0_0.load()
 # Initialize scikit-learn compatible classifier (works with either backend model)
 clf = TabFMClassifier(model=model)
 
+# Optional: enable context KV caching for prediction (PyTorch backend only).
+# clf = TabFMClassifier(
+#     model=model,
+#     cache_context=True,
+#     maybe_quantize_kv_cache=True,  # Default: int8 KV cache; False preserves cache precision
+#     keep_cache_on_device=True,    # Default: model device; False stores cache on CPU
+# )
+
 # Prepare your dataset (supports mixed numerical and categorical features)
 X_train = pd.DataFrame({
     "age": [25.0, 45.0, 35.0, 50.0],
@@ -126,6 +134,14 @@ model = tabfm_v1_0_0.load(model_type="regression")
 # Initialize scikit-learn compatible regressor (works with either backend model)
 reg = TabFMRegressor(model=model)
 
+# Optional: enable context KV caching for prediction (PyTorch backend only).
+# reg = TabFMRegressor(
+#     model=model,
+#     cache_context=True,
+#     maybe_quantize_kv_cache=True,  # Default: int8 KV cache; False preserves cache precision
+#     keep_cache_on_device=True,    # Default: model device; False stores cache on CPU
+# )
+
 # Prepare your dataset
 X_train = pd.DataFrame({
     "sqft": [1200, 2500, 1500, 3000],
@@ -144,6 +160,8 @@ predictions = reg.predict(X_test)
 
 print("Predicted Prices:", predictions)
 ```
+
+> **Note:** Context caching is disabled by default. When enabled, predictions reuse the in-context learning cache built during `fit()` to avoid repeated computation. The JAX backend does not yet support `cache_context=True`; enabling it raises `NotImplementedError` during `fit()`.
 
 ---
 
