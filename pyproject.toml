@@ -21,13 +21,15 @@ keywords = []
 #     it also requires Python >=3.11.
 #   - jaxtyping<0.3 / typeguard<3: jaxtyping 0.2.x integrates with typeguard 2.x;
 #     newer typeguard (4.x) rejects jaxtyping's shape-string annotations.
+#   - scikit-learn>=1.6 provides validate_data and the estimator parameter
+#     validation used by classifier_and_regressor.py.
 # requirements.txt remains the full pinned lock for a reproducible environment.
 dependencies = [
     "absl-py",
     "jaxtyping<0.3",
     "numpy",
     "pandas",
-    "scikit-learn",
+    "scikit-learn>=1.6",
     "scipy",
     "typeguard<3",
     "huggingface-hub",

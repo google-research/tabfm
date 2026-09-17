@@ -29,6 +29,7 @@ Key classes:
 import collections
 import itertools
 import math
+from numbers import Integral, Real
 import random
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -72,6 +73,7 @@ from sklearn.preprocessing import QuantileTransformer
 from sklearn.preprocessing import RobustScaler
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils import check_array
+from sklearn.utils._param_validation import Interval
 from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_is_fitted
 from sklearn.utils.validation import validate_data
@@ -90,6 +92,21 @@ jt.typed = jt.jaxtyped(typechecker=typeguard.typechecked)
 # this -- column-type detection must stay stable across ensemble seeds so the
 # feature schema doesn't change when only the model seed varies.
 _DEFAULT_RANDOM_STATE = 42
+
+# Numeric ensemble controls shared by the classifier and regressor. Zero is a
+# valid sentinel for batching, the SVD pool and the single-validation split.
+_ENSEMBLE_PARAMETER_CONSTRAINTS = {
+    "n_estimators": [Interval(Integral, 1, None, closed="left")],
+    "max_num_features": [Interval(Integral, 1, None, closed="left"), None],
+    "max_num_rows": [Interval(Integral, 1, None, closed="left"), None],
+    "batch_size": [Interval(Integral, 0, None, closed="left"), None],
+    "num_folds_for_cv": [Interval(Integral, 2, None, closed="left")],
+    "total_svd_pool": [Interval(Integral, 0, None, closed="left"), None],
+    "nnls_beta": [Interval(Real, 0, 1, closed="both")],
+    "min_rows_for_single_val_split": [
+        Interval(Integral, 0, None, closed="left")
+    ],
+}
 
 # ---------------------------------------------------------------------------
 # Preprocessing utilities
@@ -2353,6 +2370,11 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
   ensemble_weights_: np.ndarray
   calibration_lambda: float
 
+  _parameter_constraints = {
+      **_ENSEMBLE_PARAMETER_CONSTRAINTS,
+      "calibration_lambda": [Interval(Real, 0, None, closed="left")],
+  }
+
   def __init__(
       self,
       model: Any,
@@ -2539,6 +2561,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       ValueError
         If the number of classes exceeds the model's maximum supported classes.
     """
+    self._validate_params()
     check_classification_targets(y)
 
     # Encode class labels
@@ -3404,6 +3427,8 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
   y_oof_scaled_: np.ndarray
   ensemble_weights_: np.ndarray
 
+  _parameter_constraints = {**_ENSEMBLE_PARAMETER_CONSTRAINTS}
+
   def __init__(
       self,
       model: Any,
@@ -3554,6 +3579,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       self : TabFMRegressor
           Fitted regressor instance.
     """
+    self._validate_params()
     y_orig = np.array(y).copy()
     y = check_array(y, ensure_2d=False, dtype="numeric")
     self.X_encoder_ = TransformToNumerical(
