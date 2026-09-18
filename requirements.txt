@@ -16,7 +16,7 @@ aiofiles==23.2.1
     # via orbax-checkpoint
 annotated-doc==0.0.4
     # via typer
-anyio==4.14.1
+anyio==4.14.2
     # via httpx
 certifi==2026.6.17
     # via
