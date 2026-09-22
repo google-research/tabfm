@@ -34,6 +34,14 @@ pip install -e .[pytorch]
 ```
 *Note: For PyTorch with GPU support, ensure you have the appropriate PyTorch version installed for your CUDA version before installing TabFM.*
 
+**MLX (Apple silicon):**
+```bash
+git clone https://github.com/google-research/tabfm.git
+cd tabfm
+pip install -e .[mlx]
+```
+*Note: MLX runs on the GPU of Apple silicon Macs (M-series) and is not available on other platforms. No PyTorch or JAX installation is required to use this backend.*
+
 ### Requirements
 For a complete list of pinned dependencies and versions, please see [requirements.txt](requirements.txt). The core requirements depend on the backend you choose:
 *   Python >= 3.11
@@ -43,6 +51,8 @@ For a complete list of pinned dependencies and versions, please see [requirement
     *   Flax (specifically `flax==0.12.7`, using the modern `flax.nnx` API)
 *   **PyTorch Backend:**
     *   PyTorch (specifically `torch==2.12.1+cpu` or a GPU version)
+*   **MLX Backend (Apple silicon only):**
+    *   MLX (`mlx`) and `safetensors` (used to convert the released checkpoint)
 
 ---
 
@@ -78,7 +88,11 @@ model = tabfm_v1_0_0.load()
 # from tabfm import tabfm_v1_0_0_pytorch as tabfm_v1_0_0
 # model = tabfm_v1_0_0.load()
 
-# Initialize scikit-learn compatible classifier (works with either backend model)
+# OPTION C: MLX Backend (Apple silicon)
+# from tabfm import tabfm_v1_0_0_mlx as tabfm_v1_0_0
+# model = tabfm_v1_0_0.load()
+
+# Initialize scikit-learn compatible classifier (works with any backend model)
 clf = TabFMClassifier(model=model)
 
 # Prepare your dataset (supports mixed numerical and categorical features)
@@ -123,7 +137,7 @@ model = tabfm_v1_0_0.load(model_type="regression")
 # from tabfm import tabfm_v1_0_0_pytorch as tabfm_v1_0_0
 # model = tabfm_v1_0_0.load(model_type="regression")
 
-# Initialize scikit-learn compatible regressor (works with either backend model)
+# Initialize scikit-learn compatible regressor (works with any backend model)
 reg = TabFMRegressor(model=model)
 
 # Prepare your dataset

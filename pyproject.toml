@@ -56,6 +56,10 @@ jax = [
 pytorch = [
     "torch",
 ]
+mlx = [
+    "mlx",
+    "safetensors",
+]
 
 # Development deps (unittest, linting, formating,...)
 # Installed through `pip install -e .[dev]`

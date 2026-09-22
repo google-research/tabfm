@@ -53,6 +53,13 @@ try:
   HAS_TORCH = True
 except ImportError:
   HAS_TORCH = False
+
+try:
+  import mlx.core as mx
+  from tabfm.src.mlx.model import TabFM as MlxTabFM
+  HAS_MLX = True
+except ImportError:
+  HAS_MLX = False
 import pandas as pd
 import scipy.optimize as opt
 import scipy.special
@@ -2108,6 +2115,53 @@ def _predict_step_pytorch(
   return out_t.float().cpu().numpy()  # upcast: numpy has no bfloat16
 
 
+def _predict_step_mlx(
+    model: Any,
+    X_batch: np.ndarray,
+    y_batch: np.ndarray,
+    train_size_val: int,
+    ds_batch_val: Optional[np.ndarray],
+    cat_mask_batch: Optional[np.ndarray] = None,
+) -> np.ndarray:
+  """Runs the MLX forward pass and returns a numpy array.
+
+  Mirrors _predict_step_pytorch. MLX has no float64, so float64 inputs are
+  cast to float32 in numpy before conversion (this also sidesteps the MPS
+  float64 limitation the PyTorch path hits after device transfer).
+  """
+  if not HAS_MLX:
+    raise ImportError("MLX is required to run an MLX model.")
+
+  X_m = mx.array(np.asarray(X_batch, dtype=np.float32))
+  y_np = np.asarray(y_batch)
+  if y_np.dtype == np.float64:
+    y_np = y_np.astype(np.float32)
+  elif np.issubdtype(y_np.dtype, np.integer):
+    y_np = y_np.astype(np.int32)
+  y_m = mx.array(y_np)
+
+  batch_size = X_batch.shape[0]
+  train_size_m = mx.full(
+      (batch_size,), train_size_val, dtype=mx.int32)
+
+  if ds_batch_val is not None:
+    d_m = mx.array(np.asarray(ds_batch_val, dtype=np.int32))
+  else:
+    d_m = mx.full(
+        (batch_size,), X_batch.shape[-1], dtype=mx.int32)
+
+  cat_mask_m = (
+      mx.array(np.asarray(cat_mask_batch, dtype=bool))
+      if cat_mask_batch is not None
+      else None
+  )
+
+  out_m = model(X_m, y_m, train_size_m, cat_mask=cat_mask_m, d=d_m)
+  out_m = out_m.astype(mx.float32)  # upcast: numpy has no bfloat16
+  mx.eval(out_m)
+  return np.array(out_m)
+
+
 def _build_context_cache_pytorch(
     model: Any,
     ensemble_generator: "EnsembleGenerator",
@@ -2268,6 +2322,215 @@ def _decode_context_cache_pytorch(
   return np.concatenate(outputs, axis=0)
 
 
+def _eval_cache_mlx(cache: Any) -> None:
+  """Fully materializes an MLX context cache.
+
+  ``mx.eval`` only traverses lists/tuples/dicts, silently skipping the
+  ``ICLearningCache``/``QuantizedTensor`` dataclass leaves — leaving prefill
+  compute unevaluated until the first predict (which then pays for it).
+  Walk every leaf explicitly so fit() pays its own compute.
+  """
+  from tabfm.src.mlx.model import ICLearningCache, QuantizedTensor
+
+  stack = [cache]
+  arrays = []
+  while stack:
+    o = stack.pop()
+    if isinstance(o, mx.array):
+      arrays.append(o)
+    elif isinstance(o, QuantizedTensor):
+      stack.append(o.data)
+      stack.append(o.scale)
+    elif isinstance(o, ICLearningCache):
+      stack.append(o.layer_caches)
+      stack.append(o.prefill_train_size)
+    elif isinstance(o, dict):
+      stack.extend(o.values())
+    elif isinstance(o, (list, tuple)):
+      stack.extend(o)
+  if arrays:
+    mx.eval(*arrays)
+
+
+def _build_context_cache_mlx(
+    model: Any,
+    ensemble_generator: "EnsembleGenerator",
+    batch_size: Optional[int],
+    maybe_quantize_kv_cache: bool = True,
+    keep_cache_on_device: bool = True,
+) -> Tuple[List[Any], int]:
+  """MLX mirror of _build_context_cache_pytorch (no device moves needed)."""
+  if not HAS_MLX:
+    raise ImportError("MLX is required to run an MLX model.")
+  data_ctx = ensemble_generator.transform_context_only()
+  Xs_ctx, ys_ctx, cat_masks_ctx, ds_ctx, _ = (
+      ensemble_generator.prepare_ensemble_tensors(data_ctx)
+  )
+
+  n_members = Xs_ctx.shape[0]
+  batch_size_per_process = batch_size or n_members
+  n_batches = math.ceil(n_members / batch_size_per_process)
+  if n_batches > 1:
+    Xs_split = np.array_split(Xs_ctx, n_batches)
+    ys_split = np.array_split(ys_ctx, n_batches)
+    cat_masks_split = np.array_split(cat_masks_ctx, n_batches)
+    ds_split = np.array_split(ds_ctx, n_batches)
+  else:
+    Xs_split = [Xs_ctx]
+    ys_split = [ys_ctx]
+    cat_masks_split = [cat_masks_ctx]
+    ds_split = [ds_ctx]
+
+  caches = []
+  for X_batch, y_batch, cat_mask_batch, ds_batch in zip(
+      Xs_split, ys_split, cat_masks_split, ds_split
+  ):
+    X_m = mx.array(np.asarray(X_batch, dtype=np.float32))
+    y_np = np.asarray(y_batch)
+    if y_np.dtype == np.float64:
+      y_np = y_np.astype(np.float32)
+    elif np.issubdtype(y_np.dtype, np.integer):
+      y_np = y_np.astype(np.int32)
+    y_m = mx.array(y_np)
+    cat_mask_m = mx.array(np.asarray(cat_mask_batch, dtype=bool))
+    d_m = mx.array(np.asarray(ds_batch, dtype=np.int32))
+    _, cache = model.prefill(X_m, y_m, cat_mask=cat_mask_m, d=d_m)
+    mx.eval(cache)
+    icl_cache = cache.get("icl")
+    if maybe_quantize_kv_cache and hasattr(icl_cache, "quantize"):
+      cache["icl"] = icl_cache.quantize()
+      mx.eval(cache)
+    _eval_cache_mlx(cache)
+    caches.append(cache)
+
+  return caches, n_members
+
+
+def _concat_caches_mlx(caches: List[Any], dtype: Any) -> Any:
+  """Concatenates per-group MLX context caches along the member axis.
+
+  Lets several ensemble members share one model.decode() call (cross-member
+  batching). col-embedder reprs and prefill_train_size concatenate directly.
+  int8-quantized ICL K/V stays int8: each group was quantized with its own
+  per-tensor scale, so the merged tensor keeps the codes and carries one
+  scale per member, shaped [B, 1, 1, 1] to broadcast against [B, T, N, D].
+  Attention dequantizes a block's K/V only while that block runs, so the
+  merged cache costs int8 instead of a full-precision copy of every layer,
+  and the values are identical to decoding each group on its own. (Mixed
+  quantized/dense groups cannot share a layout, so those fall back to
+  dequantizing.) All members must have the same per-group structure (same
+  block counts and sequence lengths).
+  """
+  from tabfm.src.mlx.model import ICLearningCache, QuantizedTensor
+
+  def _member_scale(q: Any) -> mx.array:
+    """Per-member scale for one group, broadcastable to its [B,T,N,D] codes."""
+    scale = q.scale
+    if scale.ndim == 0:  # scalar, as produced by _quantize_tensor()
+      return mx.broadcast_to(scale.reshape(1, 1, 1, 1),
+                             (q.data.shape[0], 1, 1, 1))
+    return scale  # already per-member (a merge of merged caches)
+
+  def _cat_kv(parts: List[Any]) -> Any:
+    if all(isinstance(t, QuantizedTensor) for t in parts):
+      return QuantizedTensor(
+          data=mx.concatenate([t.data for t in parts], axis=0),
+          scale=mx.concatenate([_member_scale(t) for t in parts], axis=0))
+    return mx.concatenate(
+        [t.dequantize(dtype) if isinstance(t, QuantizedTensor) else t
+         for t in parts], axis=0)
+
+  col1 = [mx.concatenate([c["col1"][i] for c in caches], axis=0)
+          for i in range(len(caches[0]["col1"]))]
+  col2 = [mx.concatenate([c["col2"][i] for c in caches], axis=0)
+          for i in range(len(caches[0]["col2"]))]
+  layer_caches = []
+  for i in range(len(caches[0]["icl"].layer_caches)):
+    ks, vs = [], []
+    for c in caches:
+      k, v = c["icl"].layer_caches[i]
+      ks.append(k)
+      vs.append(v)
+    layer_caches.append((_cat_kv(ks), _cat_kv(vs)))
+  prefill_train_size = mx.concatenate(
+      [c["icl"].prefill_train_size for c in caches], axis=0)
+  return {"col1": col1, "col2": col2,
+          "icl": ICLearningCache(layer_caches=layer_caches,
+                                 prefill_train_size=prefill_train_size)}
+
+
+def _decode_context_cache_mlx(
+    model: Any,
+    ensemble_generator: "EnsembleGenerator",
+    X_transformed: np.ndarray,
+    context_caches: List[Any],
+    expected_n_members: int,
+    batch_size: Optional[int],
+    keep_cache_on_device: bool = True,
+    mlx_batch_size: Optional[int] = None,
+) -> np.ndarray:
+  """MLX mirror of _decode_context_cache_pytorch (no device moves needed)."""
+  if not HAS_MLX:
+    raise ImportError("MLX is required to run an MLX model.")
+  data_test = ensemble_generator.transform_test_only(X_transformed)
+  Xs_test, cat_masks_test, ds_test, _ = (
+      ensemble_generator.prepare_test_tensors(data_test)
+  )
+
+  n_members = Xs_test.shape[0]
+  if n_members != expected_n_members:
+    raise RuntimeError(
+        f"Number of ensemble members changed between fit() ({expected_n_members})"
+        f" and predict() ({n_members}); the context cache is stale."
+    )
+
+  batch_size_per_process = batch_size or n_members
+  n_batches = math.ceil(n_members / batch_size_per_process)
+  if n_batches > 1:
+    Xs_split = np.array_split(Xs_test, n_batches)
+    cat_masks_split = np.array_split(cat_masks_test, n_batches)
+    ds_split = np.array_split(ds_test, n_batches)
+  else:
+    Xs_split = [Xs_test]
+    cat_masks_split = [cat_masks_test]
+    ds_split = [ds_test]
+
+  if len(Xs_split) != len(context_caches):
+    raise RuntimeError(
+        "Batch grouping mismatch between fit()-time context cache"
+        f" ({len(context_caches)} groups) and predict()"
+        f" ({len(Xs_split)} groups); this should not happen because both"
+        " use the same total member count and batch_size."
+    )
+
+  # Cross-member batching: merge (test rows, caches) groups into fewer,
+  # larger decode() calls. mlx_batch_size=None means all members at once.
+  # Concatenation along the member axis is exactly equivalent (members are
+  # independent rows for the model; per-member d/train-size ride along).
+  mlx_chunk = mlx_batch_size or n_members
+  groups = list(zip(Xs_split, cat_masks_split, ds_split, context_caches))
+  chunks = [groups[i:i + mlx_chunk] for i in range(0, len(groups), mlx_chunk)]
+  compute_dtype = model.cls_tokens.dtype
+
+  outputs = []
+  for chunk in chunks:
+    if len(chunk) == 1:
+      X_batch, cat_mask_batch, ds_batch, cache = chunk[0]
+    else:
+      X_batch = np.concatenate([g[0] for g in chunk], axis=0)
+      cat_mask_batch = np.concatenate([g[1] for g in chunk], axis=0)
+      ds_batch = np.concatenate([g[2] for g in chunk], axis=0)
+      cache = _concat_caches_mlx([g[3] for g in chunk], compute_dtype)
+    X_m = mx.array(np.asarray(X_batch, dtype=np.float32))
+    cat_mask_m = mx.array(np.asarray(cat_mask_batch, dtype=bool))
+    d_m = mx.array(np.asarray(ds_batch, dtype=np.int32))
+    out_m = model.decode(X_m, cache, cat_mask=cat_mask_m, d=d_m)
+    out_m = out_m.astype(mx.float32)
+    mx.eval(out_m)
+    outputs.append(np.array(out_m))
+  return np.concatenate(outputs, axis=0)
+
+
 # Compiled predict step functions memoized on the estimators by
 # _batch_forward(). They close over nnx.jit state and cannot be pickled.
 _COMPILED_PREDICT_CACHE_ATTRS = (
@@ -2368,6 +2631,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       average_logits: bool = True,
       use_amp: bool = True,
       batch_size: Optional[int] = 1,
+      mlx_batch_size: Optional[int] = None,
       random_state: Optional[int] = _DEFAULT_RANDOM_STATE,
       verbose: bool = False,
       cat_encoder_mode: str = "appearance",
@@ -2405,7 +2669,13 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       use_amp: Whether to use automatic mixed precision (currently informational
         only).
       batch_size: Number of ensemble members to forward through the model at
-        once.  ``None`` or 0 means all at once.
+        once.  ``None`` or 0 means all at once. On the MLX backend it applies
+        to the context prefill only; the forward and cached-decode paths batch
+        by ``mlx_batch_size`` instead.
+      mlx_batch_size: Like batch_size, but only for the MLX backend
+        (cached decode and uncached forward). ``None`` (default) means all
+        members at once, which is much faster on Apple silicon; set to a
+        small int to cap memory with very large ensembles.
       random_state: Seed for ensemble randomness.
       verbose: Whether to print informational messages.
       cat_encoder_mode: Categorical encoding order (``"appearance"`` or
@@ -2460,6 +2730,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     self.average_logits = average_logits
     self.use_amp = use_amp
     self.batch_size = batch_size
+    self.mlx_batch_size = mlx_batch_size
     self.random_state = random_state
     self.verbose = verbose
     self.cat_encoder_mode = cat_encoder_mode
@@ -2681,20 +2952,31 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     categorical masks / active-feature counts needed to later decode test
     rows against those caches (see _predict_proba_internal_cached()).
 
-    Only supported on the PyTorch backend: the JAX backend's prefill()/
+    Only supported on the PyTorch/MLX backends: the JAX backend's prefill()/
     decode() are not wired up here (this classifier's caching path assumes
     the PyTorch TabFM.prefill()/decode() cache/tensor contracts).
 
     Raises:
-      NotImplementedError: If self.model is not a PyTorch nn.Module.
+      NotImplementedError: If self.model is not a PyTorch nn.Module or MLX TabFM.
     """
     is_torch = HAS_TORCH and isinstance(self.model, torch.nn.Module)
-    if not is_torch:
+    is_mlx = HAS_MLX and isinstance(self.model, MlxTabFM)
+    if not is_torch and not is_mlx:
       raise NotImplementedError(
-          "cache_context=True is only implemented for the PyTorch TabFM"
-          " backend; the JAX backend's prefill()/decode() are not wired up"
+          "cache_context=True is only implemented for the PyTorch/MLX TabFM"
+          " backends; the JAX backend's prefill()/decode() are not wired up"
           " here yet."
       )
+
+    if is_mlx:
+      self.context_caches_, self._context_n_members_ = (
+          _build_context_cache_mlx(
+              self.model, self.ensemble_generator_, self.batch_size,
+              maybe_quantize_kv_cache=self.maybe_quantize_kv_cache,
+              keep_cache_on_device=self.keep_cache_on_device,
+          )
+      )
+      return
 
     self.context_caches_, self._context_n_members_ = (
         _build_context_cache_pytorch(
@@ -2729,11 +3011,19 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
           " first."
       )
 
-    outputs = _decode_context_cache_pytorch(
-        self.model, self.ensemble_generator_, X_transformed,
-        self.context_caches_, self._context_n_members_, self.batch_size,
-        keep_cache_on_device=self.keep_cache_on_device,
-    )
+    if HAS_MLX and isinstance(self.model, MlxTabFM):
+      outputs = _decode_context_cache_mlx(
+          self.model, self.ensemble_generator_, X_transformed,
+          self.context_caches_, self._context_n_members_, self.batch_size,
+          keep_cache_on_device=self.keep_cache_on_device,
+          mlx_batch_size=getattr(self, "mlx_batch_size", None),
+      )
+    else:
+      outputs = _decode_context_cache_pytorch(
+          self.model, self.ensemble_generator_, X_transformed,
+          self.context_caches_, self._context_n_members_, self.batch_size,
+          keep_cache_on_device=self.keep_cache_on_device,
+      )
 
     _check_classifier_output_dim(outputs.shape[-1], self.n_classes_)
     outputs = outputs[..., :self.n_classes_]
@@ -2797,6 +3087,61 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         where test_size = n_samples - train_size.
     """
     is_torch = HAS_TORCH and isinstance(self.model, torch.nn.Module)
+    is_mlx = HAS_MLX and isinstance(self.model, MlxTabFM)
+
+    if is_mlx:
+      # --- MLX execution path (mirrors the PyTorch path below) ---
+      # mlx_batch_size (None = all members at once) chunks members into
+      # fewer, larger forward calls; members are independent rows.
+      mlx_bs = getattr(self, "mlx_batch_size", None) or Xs.shape[0]
+      batch_size_per_process = mlx_bs
+      n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
+      if n_batches > 1:
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        cat_masks_split = (
+            np.array_split(cat_masks, n_batches)
+            if cat_masks is not None
+            else [None] * n_batches
+        )
+        ds_split = (
+            np.array_split(ds, n_batches) if ds is not None else [None] * n_batches
+        )
+      else:
+        Xs_split = [Xs]
+        ys_split = [ys]
+        cat_masks_split = [cat_masks]
+        ds_split = [ds]
+
+      outputs = []
+      for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
+          Xs_split, ys_split, cat_masks_split, ds_split
+      ):
+        orig_batch_size = X_batch.shape[0]
+        orig_seq_len = X_batch.shape[1]
+        train_size_val = y_batch.shape[1]
+
+        # Pad y to match X length along sequence dimension if needed
+        if y_batch.shape[1] < X_batch.shape[1]:
+          y_batch = np.pad(
+              y_batch,
+              ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
+              mode="constant",
+              constant_values=-100.0,
+          )
+
+        out = _predict_step_mlx(
+            self.model,
+            X_batch,
+            y_batch,
+            train_size_val,
+            ds_batch_val,
+            cat_mask_batch,
+        )
+        # Slice output to keep only test predictions and unpadded batch.
+        out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
+        outputs.append(out)
+      return np.concatenate(outputs, axis=0)
 
     if is_torch:
       # --- PyTorch execution path ---
@@ -3416,6 +3761,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       max_num_rows: Optional[int] = None,
       use_amp: bool = True,
       batch_size: Optional[int] = 1,
+      mlx_batch_size: Optional[int] = None,
       random_state: Optional[int] = _DEFAULT_RANDOM_STATE,
       verbose: bool = False,
       cat_encoder_mode: str = "appearance",
@@ -3445,7 +3791,11 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       max_num_rows: Maximum number of rows to subsample per ensemble member.
       use_amp: Whether to use automatic mixed precision (informational only).
       batch_size: Number of ensemble members to forward at once.  ``None`` or 0
-        means all at once.
+        means all at once. On the MLX backend it applies to the context
+        prefill only; the forward and cached-decode paths batch by
+        ``mlx_batch_size`` instead.
+      mlx_batch_size: Like batch_size, but only for the MLX backend.
+        ``None`` (default) means all members at once.
       random_state: Seed for ensemble randomness.
       verbose: Whether to print informational messages.
       cat_encoder_mode: Categorical encoding order (``"appearance"`` or
@@ -3491,6 +3841,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     self.max_num_rows = max_num_rows
     self.use_amp = use_amp
     self.batch_size = batch_size
+    self.mlx_batch_size = mlx_batch_size
     self.random_state = random_state
     self.verbose = verbose
     self.cat_encoder_mode = cat_encoder_mode
@@ -3642,20 +3993,31 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     caches on self.context_caches_ for later decoding of test rows (see
     _predict_internal_cached()).
 
-    Only supported on the PyTorch backend: the JAX backend's prefill()/
+    Only supported on the PyTorch/MLX backends: the JAX backend's prefill()/
     decode() are not wired up here (this regressor's caching path assumes
     the PyTorch TabFM.prefill()/decode() cache/tensor contracts).
 
     Raises:
-      NotImplementedError: If self.model is not a PyTorch nn.Module.
+      NotImplementedError: If self.model is not a PyTorch nn.Module or MLX TabFM.
     """
     is_torch = HAS_TORCH and isinstance(self.model, torch.nn.Module)
-    if not is_torch:
+    is_mlx = HAS_MLX and isinstance(self.model, MlxTabFM)
+    if not is_torch and not is_mlx:
       raise NotImplementedError(
-          "cache_context=True is only implemented for the PyTorch TabFM"
-          " backend; the JAX backend's prefill()/decode() are not wired up"
+          "cache_context=True is only implemented for the PyTorch/MLX TabFM"
+          " backends; the JAX backend's prefill()/decode() are not wired up"
           " here yet."
       )
+
+    if is_mlx:
+      self.context_caches_, self._context_n_members_ = (
+          _build_context_cache_mlx(
+              self.model, self.ensemble_generator_, self.batch_size,
+              maybe_quantize_kv_cache=self.maybe_quantize_kv_cache,
+              keep_cache_on_device=self.keep_cache_on_device,
+          )
+      )
+      return
 
     self.context_caches_, self._context_n_members_ = (
         _build_context_cache_pytorch(
@@ -3688,11 +4050,19 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
           " first."
       )
 
-    outputs = _decode_context_cache_pytorch(
-        self.model, self.ensemble_generator_, X_transformed,
-        self.context_caches_, self._context_n_members_, self.batch_size,
-        keep_cache_on_device=self.keep_cache_on_device,
-    )
+    if HAS_MLX and isinstance(self.model, MlxTabFM):
+      outputs = _decode_context_cache_mlx(
+          self.model, self.ensemble_generator_, X_transformed,
+          self.context_caches_, self._context_n_members_, self.batch_size,
+          keep_cache_on_device=self.keep_cache_on_device,
+          mlx_batch_size=getattr(self, "mlx_batch_size", None),
+      )
+    else:
+      outputs = _decode_context_cache_pytorch(
+          self.model, self.ensemble_generator_, X_transformed,
+          self.context_caches_, self._context_n_members_, self.batch_size,
+          keep_cache_on_device=self.keep_cache_on_device,
+      )
     _check_regressor_output_dim(outputs.shape[-1])
     return outputs.squeeze(-1)
 
@@ -3722,6 +4092,59 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       Model outputs of shape (n_datasets, n_test, output_dim).
     """
     is_torch = HAS_TORCH and isinstance(self.model, torch.nn.Module)
+    is_mlx = HAS_MLX and isinstance(self.model, MlxTabFM)
+
+    if is_mlx:
+      # --- MLX execution path (mirrors the PyTorch path below) ---
+      mlx_bs = getattr(self, "mlx_batch_size", None) or Xs.shape[0]
+      batch_size_per_process = mlx_bs
+      n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
+      if n_batches > 1:
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        cat_masks_split = (
+            np.array_split(cat_masks, n_batches)
+            if cat_masks is not None
+            else [None] * n_batches
+        )
+        ds_split = (
+            np.array_split(ds, n_batches) if ds is not None else [None] * n_batches
+        )
+      else:
+        Xs_split = [Xs]
+        ys_split = [ys]
+        cat_masks_split = [cat_masks]
+        ds_split = [ds]
+
+      outputs = []
+      for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
+          Xs_split, ys_split, cat_masks_split, ds_split
+      ):
+        orig_batch_size = X_batch.shape[0]
+        orig_seq_len = X_batch.shape[1]
+        train_size_val = y_batch.shape[1]
+
+        # Pad y to match X length along sequence dimension if needed
+        if y_batch.shape[1] < X_batch.shape[1]:
+          y_batch = np.pad(
+              y_batch,
+              ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
+              mode="constant",
+              constant_values=-100.0,
+          )
+
+        out = _predict_step_mlx(
+            self.model,
+            X_batch,
+            y_batch,
+            train_size_val,
+            ds_batch_val,
+            cat_mask_batch,
+        )
+        # Slice output to keep only test predictions and unpadded batch.
+        out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
+        outputs.append(out)
+      return np.concatenate(outputs, axis=0)
 
     if is_torch:
       # --- PyTorch execution path ---
