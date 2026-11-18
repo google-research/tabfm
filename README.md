@@ -46,10 +46,21 @@ For a complete list of pinned dependencies and versions, please see [requirement
 
 ---
 
+## License notice for pretrained weights
+
+> **Important:** The TabFM source code in this repository is licensed under
+> Apache-2.0. However, the default Quick Start calls `tabfm_v1_0_0.load()`,
+> which automatically downloads pretrained weights from Hugging Face. Those
+> pretrained weights are distributed under the separate
+> `tabfm-non-commercial-v1.0` license and are restricted to non-commercial,
+> non-production use. Commercial or production use of the default pretrained
+> weights is **not permitted**.
+
+---
+
 ## Quick Start (TabFM v1.0.0)
 
-We provide pre-trained weights for the **TabFM v1.0.0** release. The library handles downloading and loading these weights automatically. You can choose to load the model using either the JAX or PyTorch backend.
-
+We provide pre-trained weights for the **TabFM v1.0.0** release. The library handles downloading and loading these weights automatically from Hugging Face. These default weights are governed by the separate `tabfm-non-commercial-v1.0` license described above.
 ### 1. Classification Example
 
 ```python
@@ -156,6 +167,25 @@ Our model evaluation results can be found in [results/](results/).
 
 ---
 
+## FAQ
+
+### Is there a maximum table size for TabFM inputs?
+
+TabFM uses in-context learning over a bounded context window, so very large
+tables should be sampled or split before inference. The scikit-learn estimators
+expose the main practical limits through `max_num_features` and `max_num_rows`
+(defaults are 500 features and 100 context rows), plus `n_estimators` for
+ensembling over multiple sampled contexts and `inference_batch_size` for memory
+control. If your dataset is larger than these limits, TabFM will work with the
+sampled/context rows rather than consuming the full table at once.
+
+### Is there a TabFM technical report or paper?
+
+A technical report is not included in this repository at this time. If a report
+or paper describing the architecture, training pipeline, datasets, and evaluation
+methodology is released, this README will be updated with a link.
+
+---
 ## Running Tests
 
 You can run the unit tests directly using Python's `unittest` module:
@@ -170,6 +200,7 @@ PYTHONPATH=. python3 -m unittest tabfm/src/classifier_and_regressor_pytorch_test
 ```
 
 Alternatively, if you have Bazel installed, you can run tests with:
+
 ```bash
 bazel test //...
 ```

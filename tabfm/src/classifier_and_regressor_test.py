@@ -18,6 +18,7 @@ from unittest import mock
 from absl.testing import absltest
 import numpy as np
 import pandas as pd
+from sklearn import config_context
 from sklearn.exceptions import NotFittedError
 
 try:
@@ -314,7 +315,7 @@ class OOFPredictionTest(absltest.TestCase):
     with mock.patch.object(
         classifier, "_batch_forward", side_effect=mock_forward
     ) as mock_batch_forward:
-      oof_preds = classifier.predict_oof_proba(cv=2)
+      oof_preds, _ = classifier._predict_oof_proba(cv=2)
 
       self.assertEqual(oof_preds.shape, (2, 10, 2))
       self.assertTrue(mock_batch_forward.called)
@@ -469,7 +470,7 @@ class OOFPredictionTest(absltest.TestCase):
     with mock.patch.object(
         regressor, "_batch_forward", side_effect=mock_forward
     ) as mock_batch_forward:
-      oof_preds = regressor.predict_oof(cv=2)
+      oof_preds, _ = regressor._compute_oof_preds_scaled(cv=2)
 
       self.assertEqual(oof_preds.shape, (2, 10))
       self.assertTrue(mock_batch_forward.called)
@@ -508,7 +509,7 @@ class OOFPredictionTest(absltest.TestCase):
     with mock.patch.object(
         classifier, "_batch_forward", side_effect=mock_forward
     ) as mock_batch_forward:
-      oof_preds = classifier.predict_oof_proba(cv=2)
+      oof_preds, _ = classifier._predict_oof_proba(cv=2)
 
       self.assertEqual(oof_preds.shape, (2, 10, 2))
       self.assertTrue(mock_batch_forward.called)
@@ -686,7 +687,7 @@ class ModelTypeMismatchTest(absltest.TestCase):
     regressor.fit(X, np.random.rand(10))
 
     with self.assertRaisesRegex(ValueError, "model_type='regression'"):
-      regressor.predict_oof(cv=2)
+      regressor._compute_oof_preds_scaled(cv=2)
 
   def test_classifier_predict_proba_raises_on_regression_model(self):
     classifier = TabFMClassifier(model=self._tiny_model("rmse"), n_estimators=2)
@@ -702,7 +703,7 @@ class ModelTypeMismatchTest(absltest.TestCase):
     classifier.fit(X, np.array([0, 1] * 5))
 
     with self.assertRaisesRegex(ValueError, "fit on 2 classes"):
-      classifier.predict_oof_proba(cv=2)
+      classifier._predict_oof_proba(cv=2)
 
 
 @unittest.skipUnless(HAS_JAX, "JAX is required")
@@ -739,7 +740,7 @@ class CalibrationTest(absltest.TestCase):
       )
 
       with mock.patch.object(
-          classifier, "predict_oof_proba", return_value=mock_oof
+          classifier, "_predict_oof_proba", return_value=(mock_oof, None)
       ):
         classifier.fit(X, y)
 
@@ -784,7 +785,7 @@ class CalibrationTest(absltest.TestCase):
       )
 
       with mock.patch.object(
-          classifier, "predict_oof_proba", return_value=mock_oof
+          classifier, "_predict_oof_proba", return_value=(mock_oof, None)
       ):
         classifier.fit(X, y)
 
@@ -858,7 +859,7 @@ class StackingTest(absltest.TestCase):
     mock_oof = np.random.dirichlet([1, 1], size=(2, 10))
 
     with mock.patch.object(
-        classifier, "predict_oof_proba", return_value=mock_oof
+        classifier, "_predict_oof_proba", return_value=(mock_oof, None)
     ):
       classifier.fit(X, y)
 
@@ -891,7 +892,7 @@ class StackingTest(absltest.TestCase):
     mock_oof = np.random.dirichlet([1, 1], size=(2, 50))
 
     with mock.patch.object(
-        classifier, "predict_oof_proba", return_value=mock_oof
+        classifier, "_predict_oof_proba", return_value=(mock_oof, None)
     ):
       with mock.patch.object(classifier, "_fit_calibration") as mock_fit_cal:
         classifier.fit(X, y)
@@ -919,7 +920,7 @@ class StackingTest(absltest.TestCase):
     mock_oof = np.random.dirichlet([1, 1], size=(2, 10))
 
     with mock.patch.object(
-        classifier, "predict_oof_proba", return_value=mock_oof
+        classifier, "_predict_oof_proba", return_value=(mock_oof, None)
     ):
       classifier.fit(X, y)
 
@@ -946,10 +947,11 @@ class StackingTest(absltest.TestCase):
 
     mock_oof = np.random.dirichlet([1, 1], size=(2, 10))
     with mock.patch.object(
-        classifier, "predict_oof_proba", return_value=mock_oof
+        classifier, "_predict_oof_proba", return_value=(mock_oof, None)
     ):
       classifier.fit(X, y)
 
+    self.assertIsNone(classifier.ensemble_generator_.holdout_indices_)
     self.assertEqual(classifier.ensemble_generator_.X_.shape[0], 10)
     patterns_none = classifier.ensemble_generator_.row_subsample_patterns_[
         "none"
@@ -998,6 +1000,85 @@ class StackingTest(absltest.TestCase):
       regressor.fit(X, y)
 
     self.assertEqual(mock_forward.call_count, 1)
+
+  def test_max_num_rows_with_enable_nnls_too_small_raises(self):
+    classifier = TabFMClassifier(
+        model=self.model,
+        n_estimators=2,
+        max_num_rows=2000,
+        average_logits=False,
+        enable_nnls=True,
+    )
+    X = np.random.rand(4000, 3)
+    y = np.array([0, 1] * 2000)
+    with self.assertRaisesRegex(ValueError, "reduce training pool by > 20%"):
+      classifier.fit(X, y)
+
+  def test_max_num_rows_with_enable_nnls_classifier(self):
+    classifier = TabFMClassifier(
+        model=self.model,
+        n_estimators=2,
+        max_num_rows=5000,
+        enable_nnls=True,
+        average_logits=False,
+        num_folds_for_cv=5,
+    )
+    X = np.random.rand(10000, 3)
+    y = np.array([0, 1] * 5000)
+
+    # 5% of 10000 is 500, max(1000, 500) = 1000 validation holdout rows.
+    # Left for training pool: 10000 - 1000 = 9000.
+    with mock.patch.object(
+        classifier, "_batch_forward", return_value=np.zeros((2, 1000, 2))
+    ) as mock_forward:
+      classifier.fit(X, y)
+
+    self.assertIsNotNone(classifier.ensemble_generator_.holdout_indices_)
+    self.assertLen(classifier.ensemble_generator_.holdout_indices_, 1000)
+    self.assertEqual(mock_forward.call_count, 1)
+
+  def test_max_num_rows_with_enable_nnls_regressor(self):
+    regressor = TabFMRegressor(
+        model=self.model,
+        n_estimators=2,
+        max_num_rows=5000,
+        enable_nnls=True,
+        num_folds_for_cv=5,
+    )
+    X = np.random.rand(40000, 3)
+    y = np.random.rand(40000)
+
+    # 5% of 40000 is 2000 (true 5% regime between 1k floor and 10k cap).
+    with mock.patch.object(
+        regressor, "_batch_forward", return_value=np.zeros((2, 2000, 1))
+    ) as mock_forward:
+      regressor.fit(X, y)
+
+    self.assertIsNotNone(regressor.ensemble_generator_.holdout_indices_)
+    self.assertLen(regressor.ensemble_generator_.holdout_indices_, 2000)
+    self.assertEqual(mock_forward.call_count, 1)
+
+  def test_max_num_rows_greater_than_N_with_enable_nnls_uses_cv(self):
+    classifier = TabFMClassifier(
+        model=self.model,
+        n_estimators=2,
+        max_num_rows=6000,
+        enable_nnls=True,
+        average_logits=False,
+        num_folds_for_cv=5,
+    )
+    X = np.random.rand(5500, 3)
+    y = np.array([0, 1] * 2750)
+
+    # With max_num_rows=6000 >= N=5500, no holdout set is partitioned and
+    # evaluation runs standard 5-fold CV (1100 validation rows per fold).
+    with mock.patch.object(
+        classifier, "_batch_forward", return_value=np.zeros((2, 1100, 2))
+    ) as mock_forward:
+      classifier.fit(X, y)
+
+    self.assertIsNone(classifier.ensemble_generator_.holdout_indices_)
+    self.assertEqual(mock_forward.call_count, 5)
 
 
 class EnsemblePresetTest(absltest.TestCase):
@@ -1238,6 +1319,26 @@ class ColumnNameRobustnessTest(absltest.TestCase):
     out = TransformToNumerical().fit_transform(X)
 
     self.assertEqual(out.shape, (4, 5))  # unix-ns + 4 derived features
+
+
+class GlobalPandasOutputTest(absltest.TestCase):
+  """Fit must ignore a user's global transform_output="pandas" config."""
+
+  def test_regressor_fit_with_pandas_output_config(self):
+    # A user who calls sklearn.set_config(transform_output="pandas") used to
+    # crash the regressor: the internal target StandardScaler returned a
+    # DataFrame, and `.flatten()` on it raised AttributeError. See issue #58.
+    regressor = TabFMRegressor(n_estimators=2, model=mock.Mock())
+
+    X = np.random.rand(10, 4)
+    y = np.random.rand(10)
+
+    with config_context(transform_output="pandas"):
+      regressor.fit(X, y)
+      # The target scaler stays pinned to ndarray output under the config.
+      scaled = regressor.y_scaler_.transform(y.reshape(-1, 1))
+
+    self.assertIsInstance(scaled, np.ndarray)
 
 
 if __name__ == "__main__":
