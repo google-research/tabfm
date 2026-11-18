@@ -898,7 +898,7 @@ class FeatureShuffler:
           f"Unknown method: {self.method}. Use 'random' or 'none'."
       )
 
-    return [np.array(p) for p in shuffle_patterns]
+    return [np.asarray(p, dtype=np.intp) for p in shuffle_patterns]
 
 
 class PreprocessingPipeline(TransformerMixin, BaseEstimator):
@@ -1063,6 +1063,8 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     svd_pool_end_: Ending column index in ``X_`` for the SVD features pool.
     k_crosses_list_: List of feature cross counts to sample per ensemble member.
     k_svd_list_: List of SVD feature counts to sample per ensemble member.
+    holdout_indices_: Array of absolute row indices in ``X_`` reserved for
+      global holdout validation when max_num_rows < dataset size.
   """
 
   norm_methods_: List[str]
@@ -1089,6 +1091,7 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
   svd_pool_end_: int
   k_crosses_list_: List[int]
   k_svd_list_: List[int]
+  holdout_indices_: Optional[np.ndarray]
 
   def __init__(
       self,
@@ -1106,6 +1109,7 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
       total_svd_pool: Optional[int] = None,
       random_state: Optional[int] = None,
       task: str = "classification",
+      reserve_holdout_set: bool = False,
   ):
     """Initialises the generator.
 
@@ -1130,6 +1134,8 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
         ensemble member, or ``0`` to disable.
       total_svd_pool: Total pool size of SVD features to generate.
       task: Either ``"classification"`` or ``"regression"``.
+      reserve_holdout_set: Whether to reserve holdout validation rows when
+        max_num_rows < dataset size.
     """
     self.n_estimators = n_estimators
     self.norm_methods = norm_methods
@@ -1145,6 +1151,27 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     self.total_svd_pool = total_svd_pool
     self.random_state = random_state
     self.task = task
+    self.reserve_holdout_set = reserve_holdout_set
+
+  @property
+  def holdout_indices(self) -> Optional[np.ndarray]:
+    """Public read-only accessor for global holdout validation row indices."""
+    return self.holdout_indices_
+
+  def _compute_holdout_val_size(self, n_samples: int) -> int:
+    """Compute target holdout validation set size for row-subsampling regime.
+
+    When max_num_rows is active alongside shared validation calculation,
+    we reserve a 5% holdout partition bounded between 1,000 and 10,000 rows.
+
+    Args:
+      n_samples: Total number of raw rows in the input dataset.
+
+    Returns:
+      Number of sample rows to isolate for global holdout validation.
+    """
+    return min(10000, max(1000, int(0.05 * n_samples)))
+
 
   def _get_n_features_to_add(
       self, n_features_requested: Union[int, str, None], n_cols: int
@@ -1434,7 +1461,30 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     if self.max_num_rows is not None:
       n_rows = min(n_rows, self.max_num_rows)
 
-    if n_rows < self.X_.shape[0]:
+    self.holdout_indices_ = None
+    if self.reserve_holdout_set:
+      n_val = self._compute_holdout_val_size(self.X_.shape[0])
+      if n_val > 0.20 * self.X_.shape[0]:
+        raise ValueError(
+            f"Dataset size N ({self.X_.shape[0]}) is too small to reserve"
+            f" {n_val} holdout validation rows (would reduce training pool by >"
+            " 20%). To fix this, either increase max_num_rows to be >= N (or"
+            " set it to None) so all rows are used via cross-validation without"
+            " holdout deduction, or disable NNLS and calibration. Setting"
+            " max_num_rows >= 5000 will ensure there are always sufficient"
+            " rows to support a holdout set when needed."
+        )
+      all_indices = list(range(self.X_.shape[0]))
+      val_indices_list = self.rng_.sample(all_indices, n_val)
+      val_set = set(val_indices_list)
+      train_pool = [i for i in all_indices if i not in val_set]
+      self.holdout_indices_ = np.array(val_indices_list)
+      actual_n_rows = min(len(train_pool), n_rows)
+      row_subsample_patterns = [
+          np.array(self.rng_.sample(train_pool, actual_n_rows))
+          for _ in range(self.n_estimators)
+      ]
+    elif n_rows < self.X_.shape[0]:
       row_subsample_patterns = [
           np.array(self.rng_.sample(range(self.X_.shape[0]), n_rows))
           for _ in range(self.n_estimators)
@@ -1443,7 +1493,7 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
       row_subsample_patterns = [None] * self.n_estimators
 
     # 5. Combine into configurations
-    shuffle_shift_cat_configs = list(
+    config_tuples = list(
         zip(
             shuffle_patterns,
             shift_offsets,
@@ -1451,14 +1501,14 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
             row_subsample_patterns,
         )
     )
-    self.rng_.shuffle(shuffle_shift_cat_configs)
+    self.rng_.shuffle(config_tuples)
 
     # 6. Assign Normalization Methods
     num_cycles = (
         self.n_estimators + len(self.norm_methods_) - 1
     ) // len(self.norm_methods_)
     norm_methods_for_estimators = (self.norm_methods_ * num_cycles)[: self.n_estimators]
-    full_configs = list(zip(norm_methods_for_estimators, shuffle_shift_cat_configs))
+    full_configs = list(zip(norm_methods_for_estimators, config_tuples))
 
     # Group by normalization method and separate components
     ensemble_configs: collections.OrderedDict = collections.OrderedDict()
@@ -1535,33 +1585,76 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
         X_test=None, train_fold=train_fold, val_fold=val_fold
     )
 
+  def transform_holdout(
+      self,
+  ) -> Tuple[collections.OrderedDict, List[np.ndarray]]:
+    """Generate ensemble data views for global holdout validation evaluation.
+
+    Relies on self.holdout_indices_ to define the validation set.
+
+    Returns:
+      A tuple containing:
+        - data: Ordered dictionary mapping normalization string keys to
+          (X_ensemble, y_ensemble) arrays formatted identically to transform().
+        - val_indices_list: List of absolute sample indices in the training set
+          corresponding to validation query rows for each ensemble member.
+    """
+    assert self.holdout_indices_ is not None, "Holdout set not initialized."
+    return self._transform_features(
+        X_test=None, val_indices=self.holdout_indices_,
+    )
+
   def _transform_features(
       self,
       X_test: Optional[np.ndarray],
       train_fold: Optional[np.ndarray] = None,
       val_fold: Optional[np.ndarray] = None,
+      val_indices: Optional[np.ndarray] = None,
   ) -> Tuple[collections.OrderedDict, List[np.ndarray]]:
     """Shared helper to construct transformed feature and target dictionaries.
 
     Handles feature formatting, categorical value permutations, scaling, and
-    padding for both standard test inference (transform) and out-of-fold
-    cross-validation (transform_fold).
+    padding for standard test inference, out-of-fold cross-validation, and
+    global holdout validation evaluations. Either X_test alone, train_fold and
+    val_fold alone, or val_indices alone must be specified, corresponding to
+    each of these three cases.
 
     Args:
       X_test: 2D feature array of test queries of shape (n_samples, n_features).
-        If None, the evaluation test queries are taken from self.X_[val_fold]
-        during cross-validation.
+        If None, the evaluation test queries are taken from a validation or
+        hold-out portion of the training set self.X_.
       train_fold: Optional array of indices selecting in-context training rows
         during cross-validation. If None, all active training rows are used.
       val_fold: Optional array of indices selecting evaluation validation rows
         during cross-validation.
+      val_indices: Optional array of absolute row indices in self.X_ reserved
+        for global holdout validation.
 
     Returns:
       A tuple containing:
         - data: Ordered dictionary mapping normalization keys to transformed
           feature and target batches.
-        - val_indices_list: List of absolute validation row indices per config.
+        - val_indices_list: List of absolute validation row indices per ensemble
+          member, in the order of iterating over self.ensemble_configs_ in an
+          outer loop and self.ensemble_configs_[norm_method] in an inner loop.
     """
+    assert ((
+        X_test is not None
+        and train_fold is None
+        and val_fold is None
+        and val_indices is None
+    ) or (
+        X_test is None
+        and train_fold is not None
+        and val_fold is not None
+        and val_indices is None
+    ) or (
+        X_test is None
+        and train_fold is None
+        and val_fold is None
+        and val_indices is not None
+    ))
+
     y = self.y_
     N = len(y)
 
@@ -1570,9 +1663,9 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     max_features = 0
     for (
         norm_method,
-        shuffle_shift_cat_configs,
+        config_tuples,
     ) in self.ensemble_configs_.items():
-      for shuffle_pattern, _, _, _ in shuffle_shift_cat_configs:
+      for shuffle_pattern, _, _, _ in config_tuples:
         max_features = max(max_features, len(shuffle_pattern))
 
     data: collections.OrderedDict = collections.OrderedDict()
@@ -1580,7 +1673,7 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
 
     for (
         norm_method,
-        shuffle_shift_cat_configs,
+        config_tuples,
     ) in self.ensemble_configs_.items():
       preprocessor = self.preprocessors_[norm_method]
       X_ensemble = []
@@ -1591,16 +1684,26 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
           shift_offset,
           cat_perm,
           row_sub_pattern,
-      ) in shuffle_shift_cat_configs:
+      ) in config_tuples:
         in_bag_idx = (
             row_sub_pattern if row_sub_pattern is not None else np.arange(N)
         )
 
-        if train_fold is not None and val_fold is not None:
+        if val_indices is not None:
+          # Global holdout validation: val_indices are direct absolute
+          # row indices in self.X_.
+          train_idx = in_bag_idx
+          val_idx = val_indices
+          val_indices_list.append(val_idx)
+        elif train_fold is not None and val_fold is not None:
+          # Standard CV fold evaluation: train_fold and val_fold are
+          # relative slices into in_bag_idx.
           train_idx = in_bag_idx[train_fold]
           val_idx = in_bag_idx[val_fold]
           val_indices_list.append(val_idx)
         else:
+          # Standard test inference: in_bag_idx contains all active
+          # training rows.
           train_idx = in_bag_idx
           val_idx = None
 
@@ -1752,15 +1855,15 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     max_features = 0
     for (
         norm_method,
-        shuffle_shift_cat_configs,
+        config_tuples,
     ) in self.ensemble_configs_.items():
-      for shuffle_pattern, _, _, _ in shuffle_shift_cat_configs:
+      for shuffle_pattern, _, _, _ in config_tuples:
         max_features = max(max_features, len(shuffle_pattern))
 
     data: collections.OrderedDict = collections.OrderedDict()
     for (
         norm_method,
-        shuffle_shift_cat_configs,
+        config_tuples,
     ) in self.ensemble_configs_.items():
       preprocessor = self.preprocessors_[norm_method]
       X_ensemble = []
@@ -1771,7 +1874,7 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
           shift_offset,
           cat_perm,
           row_sub_pattern,
-      ) in shuffle_shift_cat_configs:
+      ) in config_tuples:
         in_bag_idx = (
             row_sub_pattern if row_sub_pattern is not None else np.arange(N)
         )
@@ -1830,15 +1933,15 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     max_features = 0
     for (
         norm_method,
-        shuffle_shift_cat_configs,
+        config_tuples,
     ) in self.ensemble_configs_.items():
-      for shuffle_pattern, _, _, _ in shuffle_shift_cat_configs:
+      for shuffle_pattern, _, _, _ in config_tuples:
         max_features = max(max_features, len(shuffle_pattern))
 
     data: collections.OrderedDict = collections.OrderedDict()
     for (
         norm_method,
-        shuffle_shift_cat_configs,
+        config_tuples,
     ) in self.ensemble_configs_.items():
       preprocessor = self.preprocessors_[norm_method]
       X_ensemble = []
@@ -1848,7 +1951,7 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
           _,
           cat_perm,
           _,
-      ) in shuffle_shift_cat_configs:
+      ) in config_tuples:
         if cat_perm:
           X_test_to_use = X.copy()
           _apply_categorical_permutation(X_test_to_use, cat_perm)
@@ -2377,10 +2480,6 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     self.keep_cache_on_device = keep_cache_on_device
     if self.average_logits and self.enable_nnls:
       raise ValueError("average_logits and enable_nnls cannot both be True.")
-    if self.max_num_rows is not None and self.enable_nnls:
-      raise ValueError(
-          "max_num_rows and enable_nnls cannot both be set at this time."
-      )
 
   @classmethod
   def ensemble(cls, model: Any, **overrides: Any) -> "TabFMClassifier":
@@ -2483,6 +2582,15 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       n_cat = 0
     cat_features = list(range(n_cat))
 
+    is_sampling = (
+        self.max_num_rows is not None and self.max_num_rows < X.shape[0]
+    )
+    needs_validation = self.enable_nnls or (
+        self.active_calibration_method_ is not None
+        and self.active_calibration_method_ != "none"
+    )
+    reserve_holdout = is_sampling and needs_validation
+
     # Fit ensemble generator to create multiple dataset views
     self.ensemble_generator_ = EnsembleGenerator(
         n_estimators=self.n_estimators,
@@ -2498,6 +2606,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         n_feature_crosses=self.n_feature_crosses,
         n_svd_features=self.n_svd_features,
         total_svd_pool=self.total_svd_pool,
+        reserve_holdout_set=reserve_holdout,
     )
     self.ensemble_generator_.fit(X, y)
 
@@ -2505,11 +2614,10 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       self._build_context_cache()
 
     oof_probs_fit = None
-    if self.enable_nnls or (
-        self.active_calibration_method_ is not None
-        and self.active_calibration_method_ != "none"
-    ):
-      oof_probs = self.predict_oof_proba(cv=self.num_folds_for_cv)
+    y_orig_fit = None
+    y_fit = None
+    if needs_validation:
+      oof_probs, val_idx = self._predict_oof_proba(cv=self.num_folds_for_cv)
       val_idx = getattr(self, "oof_val_indices_", None)
       if val_idx is not None:
         oof_probs_fit = oof_probs[:, val_idx, :]
@@ -2520,7 +2628,9 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         y_orig_fit = y_orig
         y_fit = y
 
-    if self.enable_nnls and oof_probs_fit is not None:
+    if self.enable_nnls:
+      assert oof_probs_fit is not None
+      assert y_orig_fit is not None
       n_classes = self.n_classes_
       n_est, n_tr, _ = oof_probs_fit.shape
 
@@ -2548,8 +2658,9 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     if (
         self.active_calibration_method_ is not None
         and self.active_calibration_method_ != "none"
-        and oof_probs_fit is not None
     ):
+      assert oof_probs_fit is not None
+      assert y_fit is not None
       if self.enable_nnls:
         P = np.tensordot(self.ensemble_weights_, oof_probs_fit, axes=(0, 0))
       else:
@@ -2925,8 +3036,31 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     return state
 
   @jt.typed
-  def predict_oof_proba(self, cv: int = 5) -> jt.Float[Array | np.ndarray, "E N K"]:
-    """Perform out-of-fold predictions on the training set for each ensemble member."""
+  def _predict_oof_proba(
+      self, cv: int = 5
+  ) -> tuple[
+    jt.Float[Array | np.ndarray, "E N K"],
+    Optional[jt.Int[Array | np.ndarray, "V"]],
+  ]:
+    """Perform out-of-fold predictions on some or all training samples.
+
+    Predictions are either made using cross-validation, a single train/val
+    split, or a pre-computed holdout set. A holdout set is used when the
+    ensemble generator has a `holdout_indices` attribute. Otherwise, the
+    function decides whether to use cross-validation or a single train/val
+    split based on the number of rows and the `min_rows_for_single_val_split`
+    attribute. Regardless of the method, the output is structured such that (1)
+    there are predictions for every ensemble member on a shared set of rows and
+    (2) every prediction is generated without leakage.
+
+    Args:
+      cv: Number of cross-validation folds to use for data splitting.
+
+    Returns:
+      Tuple of (1) Out-of-fold probability predictions of shape (n_estimators,
+        n_samples, n_classes) and (2) the indices of the rows that have
+        predictions or None if all rows have predictions.
+    """
     check_is_fitted(self)
 
     N = self.ensemble_generator_.X_.shape[0]
@@ -2941,32 +3075,40 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         all_configs.append((norm_method, config))
     n_estimators = len(all_configs)
 
-    kf = KFold(n_splits=cv, shuffle=True, random_state=self.random_state)
-    # Take the number of rows from the first config if max_num_rows is given,
-    # or use N otherwise.
-    _, _, _, first_row_sub_pattern = all_configs[0][1]
-    n_rows = (
-        len(first_row_sub_pattern) if first_row_sub_pattern is not None else N
-    )
-    folds_base = list(kf.split(np.arange(n_rows)))
-
-    if (
-        getattr(self, "min_rows_for_single_val_split", 0) > 0
-        and len(folds_base[0][1]) >= self.min_rows_for_single_val_split
-    ):
-      folds_to_run = folds_base[:1]
-    else:
-      folds_to_run = folds_base
-
     outputs_oof = np.zeros((n_estimators, N, n_classes))
+    oof_val_indices = None
 
-    self.oof_val_indices_ = None
-    for fold_idx, (train_fold, val_fold) in enumerate(folds_to_run):
-      data_fold, val_indices_list = self.ensemble_generator_.transform_fold(
-          train_fold, val_fold
+    if self.ensemble_generator_.holdout_indices is not None:
+      oof_val_indices = self.ensemble_generator_.holdout_indices
+      folds_data = [self.ensemble_generator_.transform_holdout()]
+    else:
+      kf = KFold(n_splits=cv, shuffle=True, random_state=self.random_state)
+      # Take the number of rows from the first config if max_num_rows is given,
+      # or use N otherwise.
+      _, _, _, first_row_sub_pattern = all_configs[0][1]
+      n_rows = (
+          len(first_row_sub_pattern) if first_row_sub_pattern is not None else N
       )
-      if fold_idx == 0 and len(folds_to_run) == 1:
-        self.oof_val_indices_ = val_indices_list[0]
+      folds_base = list(kf.split(np.arange(n_rows)))
+
+      if (
+          getattr(self, "min_rows_for_single_val_split", 0) > 0
+          and len(folds_base[0][1]) >= self.min_rows_for_single_val_split
+      ):
+        folds_to_run = folds_base[:1]
+      else:
+        folds_to_run = folds_base
+
+      folds_data = []
+      for fold_idx, (train_fold, val_fold) in enumerate(folds_to_run):
+        data_fold, val_indices_list = self.ensemble_generator_.transform_fold(
+            train_fold, val_fold
+        )
+        if fold_idx == 0 and len(folds_to_run) == 1:
+          oof_val_indices = val_indices_list[0]
+        folds_data.append((data_fold, val_indices_list))
+
+    for data_fold, val_indices_list in folds_data:
       (
           Xs_batch,
           ys_batch,
@@ -2991,7 +3133,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         )
         outputs_oof[i, val_indices_list[i]] = out_i
 
-    return outputs_oof
+    return outputs_oof, oof_val_indices
 
   @jt.typed
   def _fit_calibration(
@@ -3364,10 +3506,6 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     self.cache_context = cache_context
     self.maybe_quantize_kv_cache = maybe_quantize_kv_cache
     self.keep_cache_on_device = keep_cache_on_device
-    if self.max_num_rows is not None and self.enable_nnls:
-      raise ValueError(
-          "max_num_rows and enable_nnls cannot both be set at this time."
-      )
 
   @classmethod
   def ensemble(cls, model: Any, **overrides: Any) -> "TabFMRegressor":
@@ -3432,8 +3570,18 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     cat_features = list(range(n_cat))
 
     self.y_scaler_ = StandardScaler()
+    # Keep ndarray output even if the user set a global
+    # sklearn.set_config(transform_output="pandas"): otherwise fit_transform
+    # returns a DataFrame, which has no .flatten().
+    self.y_scaler_.set_output(transform="default")
     y = self.y_scaler_.fit_transform(y.reshape(-1, 1)).flatten()
 
+    is_sampling = (
+        self.max_num_rows is not None and self.max_num_rows < X.shape[0]
+    )
+    needs_validation = self.enable_nnls
+    reserve_holdout = is_sampling and needs_validation
+    # Fit ensemble generator to create multiple dataset views
     self.ensemble_generator_ = EnsembleGenerator(
         n_estimators=self.n_estimators,
         norm_methods=self.norm_methods or ["none", "power"],
@@ -3449,6 +3597,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
         n_feature_crosses=self.n_feature_crosses,
         n_svd_features=self.n_svd_features,
         total_svd_pool=self.total_svd_pool,
+        reserve_holdout_set=reserve_holdout,
     )
     self.ensemble_generator_.fit(X, y)
 
@@ -3456,10 +3605,9 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       self._build_context_cache()
 
     if self.enable_nnls:
-      self.y_oof_scaled_ = self._compute_oof_preds_scaled(
+      self.y_oof_scaled_, val_idx = self._compute_oof_preds_scaled(
           cv=self.num_folds_for_cv
       )
-      val_idx = getattr(self, "oof_val_indices_", None)
       y_oof_scaled_fit = (
           self.y_oof_scaled_[:, val_idx]
           if val_idx is not None
@@ -3806,25 +3954,34 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       state.pop(attr, None)
     return state
 
+
   @jt.typed
-  def predict_oof(self, cv: int = 5) -> jt.Float[Array | np.ndarray, "E N"]:
-    """Perform out-of-fold predictions on the training set for each ensemble member."""
-    check_is_fitted(self)
-
-    outputs_oof_scaled = self._compute_oof_preds_scaled(cv=cv)
-    n_estimators, N = outputs_oof_scaled.shape
-
-    outputs_oof = np.zeros((n_estimators, N))
-    for i in range(n_estimators):
-      outputs_oof[i, :] = self._inverse_transform_y(outputs_oof_scaled[i])
-
-    return outputs_oof
-
   def _compute_oof_preds_scaled(
       self,
       cv: int = 5,
-  ) -> np.ndarray:
-    """Helper to compute OOF predictions in the scaled space."""
+  ) -> tuple[
+    jt.Float[Array | np.ndarray, "E N"],
+    Optional[jt.Int[Array | np.ndarray, "V"]],
+  ]:
+    """Perform out-of-fold predictions on some or all training samples.
+
+    Predictions are either made using cross-validation, a single train/val
+    split, or a pre-computed holdout set. A holdout set is used when the
+    ensemble generator has a `holdout_indices` attribute. Otherwise, the
+    function decides whether to use cross-validation or a single train/val
+    split based on the number of rows and the `min_rows_for_single_val_split`
+    attribute. Regardless of the method, the output is structured such that (1)
+    there are predictions for every ensemble member on a shared set of rows and
+    (2) every prediction is generated without leakage.
+
+    Args:
+      cv: Number of cross-validation folds to use for data splitting.
+
+    Returns:
+      Tuple of (1) Out-of-fold scaled predictions of shape (n_estimators,
+        n_samples, n_classes) and (2) the indices of the rows that have
+        predictions or None if all rows have predictions.
+    """
     check_is_fitted(self)
 
     N = self.ensemble_generator_.X_.shape[0]
@@ -3838,32 +3995,40 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
         all_configs.append((norm_method, config))
     n_estimators = len(all_configs)
 
-    kf = KFold(n_splits=cv, shuffle=True, random_state=self.random_state)
-    # Take the number of rows from the first config if max_num_rows is given,
-    # or use N otherwise.
-    _, _, _, first_row_sub_pattern = all_configs[0][1]
-    n_rows = (
-        len(first_row_sub_pattern) if first_row_sub_pattern is not None else N
-    )
-    folds_base = list(kf.split(np.arange(n_rows)))
-
     outputs_oof = np.zeros((n_estimators, N))
+    oof_val_indices = None
 
-    if (
-        getattr(self, "min_rows_for_single_val_split", 0) > 0
-        and len(folds_base[0][1]) >= self.min_rows_for_single_val_split
-    ):
-      folds_to_run = folds_base[:1]
+    if self.ensemble_generator_.holdout_indices is not None:
+      oof_val_indices = self.ensemble_generator_.holdout_indices
+      folds_data = [self.ensemble_generator_.transform_holdout()]
     else:
-      folds_to_run = folds_base
-
-    self.oof_val_indices_ = None
-    for fold_idx, (train_fold, val_fold) in enumerate(folds_to_run):
-      data_fold, val_indices_list = self.ensemble_generator_.transform_fold(
-          train_fold, val_fold
+      kf = KFold(n_splits=cv, shuffle=True, random_state=self.random_state)
+      # Take the number of rows from the first config if max_num_rows is given,
+      # or use N otherwise.
+      _, _, _, first_row_sub_pattern = all_configs[0][1]
+      n_rows = (
+          len(first_row_sub_pattern) if first_row_sub_pattern is not None else N
       )
-      if fold_idx == 0 and len(folds_to_run) == 1:
-        self.oof_val_indices_ = val_indices_list[0]
+      folds_base = list(kf.split(np.arange(n_rows)))
+
+      if (
+          getattr(self, "min_rows_for_single_val_split", 0) > 0
+          and len(folds_base[0][1]) >= self.min_rows_for_single_val_split
+      ):
+        folds_to_run = folds_base[:1]
+      else:
+        folds_to_run = folds_base
+
+      folds_data = []
+      for fold_idx, (train_fold, val_fold) in enumerate(folds_to_run):
+        data_fold, val_indices_list = self.ensemble_generator_.transform_fold(
+            train_fold, val_fold
+        )
+        if fold_idx == 0 and len(folds_to_run) == 1:
+          oof_val_indices = val_indices_list[0]
+        folds_data.append((data_fold, val_indices_list))
+
+    for data_fold, val_indices_list in folds_data:
       (
           Xs_batch,
           ys_batch,
@@ -3882,7 +4047,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       for i in range(n_estimators):
         outputs_oof[i, val_indices_list[i]] = preds[i]
 
-    return outputs_oof
+    return outputs_oof, oof_val_indices
 
   @jt.typed
   def _predict_internal(self, X: Any) -> jt.Float[Array | np.ndarray, "E T"]:

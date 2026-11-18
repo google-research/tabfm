@@ -692,7 +692,7 @@ _FFN_CHUNK_SIZE = 8192   # tokens per chunk (feed-forward expansion in every blo
 
 
 class TabFM(nn.Module):
-  def __init__(self, *, embed_dim=8, max_classes=3, col_num_blocks=2,
+  def __init__(self, *, embed_dim=8, max_classes=10, col_num_blocks=2,
                col_nhead=2, col_num_inds=4, row_num_blocks=2, row_nhead=2,
                row_num_cls=2, icl_num_blocks=2, icl_nhead=2, ff_factor=2,
                feature_group_size=3, num_freq=32, decoder_hidden=None,
