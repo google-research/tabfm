@@ -32,7 +32,6 @@ L: Generic linear/feature dimension
 Y: Number of layers (a.k.a blocks)
 """
 
-from absl import logging
 import chex
 import math
 from math import pi
