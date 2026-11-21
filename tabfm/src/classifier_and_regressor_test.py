@@ -28,6 +28,8 @@ try:
 except ImportError:
   HAS_JAX = False
 from tabfm.src.classifier_and_regressor import _looks_like_datetime
+from tabfm.src.classifier_and_regressor import CategoricalOrdinalEncoder
+from tabfm.src.classifier_and_regressor import DatetimeTransformer
 from tabfm.src.classifier_and_regressor import EnsembleGenerator
 from tabfm.src.classifier_and_regressor import TabFMClassifier
 from tabfm.src.classifier_and_regressor import TabFMRegressor
@@ -1244,6 +1246,44 @@ class DatetimeDetectionTest(absltest.TestCase):
             "k", "l", "m", "2020-01-01", "2021-05-02"]  # 2/20 = 10% dates
     self.assertFalse(_looks_like_datetime(pd.Series(vals, dtype=object)))
     self.assertFalse(_looks_like_datetime(pd.Series(vals, dtype="string")))
+
+
+class CategoricalOrdinalEncoderTest(absltest.TestCase):
+
+  def test_missing_and_unknown_values_are_encoded_separately(self):
+    encoder = CategoricalOrdinalEncoder(
+        unknown_value=-1, encoded_missing_value=-99
+    )
+    encoder.fit(np.array([["known"], ["other"]], dtype=object))
+
+    encoded = encoder.transform(
+        np.array([[np.nan], ["unseen"], ["known"]], dtype=object)
+    )
+
+    np.testing.assert_array_equal(encoded[:, 0], [-99, -1, 0])
+
+  def test_inverse_transform_does_not_decode_the_missing_sentinel(self):
+    encoder = CategoricalOrdinalEncoder(
+        unknown_value=-1, encoded_missing_value=-99
+    )
+    encoder.fit(np.array([["known"], ["other"]], dtype=object))
+
+    decoded = encoder.inverse_transform(np.array([[-99], [-1], [0]]))
+
+    self.assertIsNone(decoded[0, 0])
+    self.assertIsNone(decoded[1, 0])
+    self.assertEqual(decoded[2, 0], "known")
+
+
+class DatetimeTransformerTest(absltest.TestCase):
+
+  def test_all_missing_column_uses_epoch_fill_value(self):
+    X = pd.DataFrame({"ts": pd.to_datetime([None, None, None])})
+
+    transformed = DatetimeTransformer().fit_transform(X)
+
+    self.assertEqual(transformed.shape, (3, 5))
+    self.assertTrue(np.isfinite(transformed).all())
 
 
 class ColumnNameRobustnessTest(absltest.TestCase):

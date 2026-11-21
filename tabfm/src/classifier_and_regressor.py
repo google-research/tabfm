@@ -208,6 +208,7 @@ class CategoricalOrdinalEncoder(BaseEstimator, TransformerMixin):
 
     for i in range(n_features):
       col = X[:, i]
+      missing_mask = pd.isna(col)
       cats = self.categories_[i]
       cat_to_idx = {c: idx for idx, c in enumerate(cats)}
       mapped = pd.Series(col).map(cat_to_idx)
@@ -216,7 +217,9 @@ class CategoricalOrdinalEncoder(BaseEstimator, TransformerMixin):
       if mapped.dtype.name == "category":
         mapped = mapped.astype(object)
 
-      # Fill NaNs/Unknowns with unknown_value
+      mapped.loc[missing_mask] = self.encoded_missing_value
+
+      # Fill unknowns with unknown_value
       X_out[:, i] = mapped.fillna(self.unknown_value).values.astype(self.dtype)
 
     return X_out
@@ -239,7 +242,9 @@ class CategoricalOrdinalEncoder(BaseEstimator, TransformerMixin):
     for i in range(n_features):
       col = X[:, i]
       cats = self.categories_[i]
-      valid_mask = col != self.unknown_value
+      valid_mask = (col != self.unknown_value) & (
+          col != self.encoded_missing_value
+      )
       if np.any(valid_mask):
         indices = col[valid_mask].astype(int)
         X_out[valid_mask, i] = cats[indices]
@@ -334,7 +339,10 @@ class DatetimeTransformer(BaseEstimator, TransformerMixin):
       series = pd.to_datetime(
           X.iloc[:, pos], utc=True, errors="coerce", format="mixed"
       )
-      self._fillna_map[pos] = series.mean()
+      fillna_value = series.mean()
+      if pd.isna(fillna_value):
+        fillna_value = pd.Timestamp(0, tz="UTC")
+      self._fillna_map[pos] = fillna_value
     return self
 
   def transform(self, X: Any) -> np.ndarray:
